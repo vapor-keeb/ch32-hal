@@ -1,10 +1,13 @@
 use core::cell::UnsafeCell;
 use core::future::poll_fn;
 use core::marker::PhantomData;
+use core::mem::MaybeUninit;
 use core::sync::atomic::AtomicBool;
+use core::task::Poll;
 
+use defmt::{info, trace};
 use embassy_sync::waitqueue::AtomicWaker;
-use embassy_usb_driver::{self as driver, Direction, EndpointAddress, EndpointError, EndpointInfo, EndpointType};
+use embassy_usb_driver::{self as driver, Direction, EndpointAddress, EndpointError, EndpointInfo, EndpointType, Event};
 
 use crate::gpio::{AFType, Speed};
 use crate::{interrupt, peripherals, Peripheral, RccPeripheral};
@@ -55,8 +58,19 @@ pub struct InterruptHandler<T: Instance> {
 }
 
 #[repr(C, align(4))]
+#[derive(Clone, Copy)]
 pub struct EpOutBuffer {
     data: [u8; MAX_EP_OUT_BUFFER as usize],
+}
+
+impl Default for EpOutBuffer {
+    fn default() -> Self {
+        unsafe {
+            EpOutBuffer {
+                data: core::mem::zeroed(),
+            }
+        }
+    }
 }
 
 const NEW_AW: AtomicWaker = AtomicWaker::new();
@@ -130,6 +144,78 @@ where
     }
 }
 
+impl<'d, T: Instance> driver::Driver<'d> for Driver<'d, T> {
+    type EndpointOut = Endpoint<'d, T, Out>;
+
+    type EndpointIn = Endpoint<'d, T, In>;
+
+    type ControlPipe = ControlPipe<'d, T>;
+
+    type Bus = Bus<'d, T>;
+
+    fn alloc_endpoint_out(
+        &mut self,
+        ep_type: driver::EndpointType,
+        max_packet_size: u16,
+        interval_ms: u8,
+    ) -> Result<Self::EndpointOut, driver::EndpointAllocError> {
+        todo!();
+    }
+
+    fn alloc_endpoint_in(
+        &mut self,
+        ep_type: driver::EndpointType,
+        max_packet_size: u16,
+        interval_ms: u8,
+    ) -> Result<Self::EndpointIn, driver::EndpointAllocError> {
+        todo!()
+    }
+
+    fn start(self, control_max_packet_size: u16) -> (Self::Bus, Self::ControlPipe) {
+        let regs = T::regs();
+
+        let ep_out = Endpoint {
+            _phantom: PhantomData,
+            info: EndpointInfo {
+                addr: EndpointAddress::from_parts(0, Direction::Out),
+                ep_type: EndpointType::Control,
+                max_packet_size: 64,
+                interval_ms: 0,
+            },
+        };
+
+        let ep_in = Endpoint {
+            _phantom: PhantomData,
+            info: EndpointInfo {
+                addr: EndpointAddress::from_parts(0, Direction::In),
+                ep_type: EndpointType::Control,
+                max_packet_size: 64,
+                interval_ms: 0,
+            },
+        };
+
+        // Hookup the bus on start?
+        regs.udev_ctrl().write(|w| {
+            // different from reference code
+            // board has no pulldown
+            w.set_pd_dis(false);
+            w.set_port_en(true);
+        });
+
+        (
+            Bus {
+                _phantom: PhantomData,
+                inited: false,
+            },
+            ControlPipe {
+                ep_in,
+                ep_out,
+                setup_state: &T::state().control_state,
+            },
+        )
+    }
+}
+
 /// USB endpoint direction.
 trait Dir {
     /// Returns the direction value.
@@ -159,6 +245,38 @@ pub struct Endpoint<'d, T, D> {
     // state: &'d EpState,
 }
 
+impl<'d, T: Instance> driver::Endpoint for Endpoint<'d, T, In> {
+    fn info(&self) -> &EndpointInfo {
+        &self.info
+    }
+
+    async fn wait_enabled(&mut self) {
+        todo!()
+    }
+}
+
+impl<'d, T: Instance> driver::EndpointIn for Endpoint<'d, T, In> {
+    async fn write(&mut self, buf: &[u8]) -> Result<(), EndpointError> {
+        todo!()
+    }
+}
+
+impl<'d, T: Instance> driver::Endpoint for Endpoint<'d, T, Out> {
+    fn info(&self) -> &EndpointInfo {
+        &self.info
+    }
+
+    async fn wait_enabled(&mut self) {
+        todo!()
+    }
+}
+
+impl<'d, T: Instance> driver::EndpointOut for Endpoint<'d, T, Out> {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, EndpointError> {
+        todo!()
+    }
+}
+
 pub struct ControlPipe<'d, T> {
     ep_in: Endpoint<'d, T, In>,
     ep_out: Endpoint<'d, T, Out>,
@@ -170,17 +288,35 @@ pub struct Bus<'d, T> {
     inited: bool,
 }
 
-impl <'d, T> driver::Bus for Bus<'d, T> where T: Instance {
+impl<'d, T> driver::Bus for Bus<'d, T>
+where
+    T: Instance,
+{
     async fn enable(&mut self) {
-        // TODO: ???
+        trace!("Enable")
     }
 
     async fn disable(&mut self) {
         // TODO: ???
+        trace!("Disable")
     }
 
     async fn poll(&mut self) -> embassy_usb_driver::Event {
-        todo!()
+        poll_fn(move |ctx| {
+            BUS_WAKER.register(ctx.waker());
+            trace!("polling");
+
+            if !self.inited {
+                self.inited = true;
+                return Poll::Ready(Event::PowerDetected);
+            }
+
+            // Somehow detect a bus reset needs to happen
+            todo!();
+
+            Poll::Pending
+        })
+        .await
     }
 
     fn endpoint_set_enabled(&mut self, ep_addr: EndpointAddress, enabled: bool) {
@@ -196,111 +332,6 @@ impl <'d, T> driver::Bus for Bus<'d, T> where T: Instance {
     }
 
     async fn remote_wakeup(&mut self) -> Result<(), embassy_usb_driver::Unsupported> {
-        todo!()
-    }
-}
-
-impl<'d, T> Driver<'d, T>
-where
-    T: Instance,
-{
-    fn alloc_endpoint<D: Dir>(&mut self, ep_type: driver::EndpointType, max_packet_size: u16) -> Endpoint<'d, T, D> {
-        assert!(max_packet_size <= MAX_EP_OUT_BUFFER);
-        todo!()
-    }
-}
-
-// impl<'d, T> driver::Driver<'d> for Driver<'d, T>
-// where
-//     T: Instance,
-// {
-//     type EndpointOut = Endpoint<'d, T, Out>;
-
-//     type EndpointIn = Endpoint<'d, T, In>;
-
-//     type ControlPipe = ControlPipe<'d, T>;
-
-//     type Bus = Bus<'d, T>;
-
-//     fn alloc_endpoint_out(
-//         &mut self,
-//         ep_type: driver::EndpointType,
-//         max_packet_size: u16,
-//         interval_ms: u8,
-//     ) -> Result<Self::EndpointOut, driver::EndpointAllocError> {
-//         todo!();
-//     }
-
-//     fn alloc_endpoint_in(
-//         &mut self,
-//         ep_type: driver::EndpointType,
-//         max_packet_size: u16,
-//         interval_ms: u8,
-//     ) -> Result<Self::EndpointIn, driver::EndpointAllocError> {
-//         todo!()
-//     }
-
-//     fn start(self, control_max_packet_size: u16) -> (Self::Bus, Self::ControlPipe) {
-//         let regs = T::regs();
-
-//         let ep_out = Endpoint {
-//             _phantom: PhantomData,
-//             info: EndpointInfo {
-//                 addr: EndpointAddress::from_parts(0, Direction::Out),
-//                 ep_type: EndpointType::Control,
-//                 max_packet_size: 64,
-//                 interval_ms: 0,
-//             },
-//         };
-
-//         let ep_in = Endpoint {
-//             _phantom: PhantomData,
-//             info: EndpointInfo {
-//                 addr: EndpointAddress::from_parts(0, Direction::In),
-//                 ep_type: EndpointType::Control,
-//                 max_packet_size: 64,
-//                 interval_ms: 0,
-//             },
-//         };
-
-//         // Hookup the bus on start?
-//         regs.udev_ctrl().write(|w| {
-//             // different from reference code
-//             // board has no pulldown
-//             w.set_pd_dis(false);
-//             w.set_port_en(true);
-//         });
-
-//         (
-//             Bus {
-//                 _phantom: PhantomData,
-//                 inited: false,
-//             },
-//             ControlPipe {
-//                 ep_in,
-//                 ep_out,
-//                 setup_state: &T::state().control_state,
-//             },
-//         )
-//     }
-// }
-
-impl<'d, T: Instance> driver::Endpoint for Endpoint<'d, T, In> {
-    fn info(&self) -> &EndpointInfo {
-        &self.info
-    }
-
-    async fn wait_enabled(&mut self) {
-        todo!()
-    }
-}
-
-impl<'d, T: Instance> driver::Endpoint for Endpoint<'d, T, Out> {
-    fn info(&self) -> &EndpointInfo {
-        &self.info
-    }
-
-    async fn wait_enabled(&mut self) {
         todo!()
     }
 }
