@@ -72,6 +72,8 @@ embassy = [
 ]
 defmt = ["dep:defmt"]
 
+usb = ["dep:embassy-usb-driver"]
+
 # Features starting with `_` are for internal use only. They're not intended
 # to be enabled by other crates, and are not covered by semver guarantees.
 _time-driver = []
