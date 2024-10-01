@@ -1,19 +1,53 @@
 use core::cell::UnsafeCell;
 use core::future::poll_fn;
 use core::marker::PhantomData;
-use core::mem::MaybeUninit;
-use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Poll;
 
-use defmt::{info, trace};
+use defmt::trace;
 use embassy_sync::waitqueue::AtomicWaker;
-use embassy_usb_driver::{self as driver, Direction, EndpointAddress, EndpointError, EndpointInfo, EndpointType, Event};
+use embassy_usb_driver::{
+    self as driver, Direction, EndpointAddress, EndpointError, EndpointInfo, EndpointType, Event,
+};
 
 use crate::gpio::{AFType, Speed};
+use crate::interrupt::typelevel::{Handler, Interrupt};
+use crate::peripherals::OTG_FS;
 use crate::{interrupt, peripherals, Peripheral, RccPeripheral};
 
 const NR_EP: usize = 16;
 const MAX_EP_OUT_BUFFER: u16 = 64;
+
+pub struct InterruptHandler<T: Instance> {
+    _phantom: PhantomData<T>,
+}
+
+#[qingke_rt::interrupt]
+unsafe fn OTG_FS() {
+    InterruptHandler::<OTG_FS>::on_interrupt();
+}
+
+/* Interrupt Handlers
+
+   AFAICT, LP is triggered for **ALL** events, and HP is only triggered on
+   "double buffered" bulk transfers and iso transfers. I think we can safely
+   ignore that for now. WKUP is for well USB WakeUp events
+*/
+impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandler<T> {
+    unsafe fn on_interrupt() {
+        let regs = T::regs();
+        let int_fg = regs.int_fg().read();
+        trace!(
+            "int fg {:#b}: RST:{1=0..1:b}, XFER: {1=1..2:b}, SUSPEND: {1=2..3:b}, FIFO_OV: {1=4..5:b}",
+            int_fg.0,
+            int_fg.0
+        );
+
+        if int_fg.bus_rst() || int_fg.suspend() {
+            trace!("Interrupt Upper IRQ: {}", T::Interrupt::is_enabled());
+        }
+    }
+}
 
 struct ControlPipeSetupState {
     setup_data: UnsafeCell<[u8; 8]>,
@@ -51,10 +85,6 @@ pub struct Driver<'d, T: Instance> {
 struct EndpointData {
     ep_type: EndpointType,
     max_packet_size: u16,
-}
-
-pub struct InterruptHandler<T: Instance> {
-    phantom: PhantomData<T>,
 }
 
 #[repr(C, align(4))]
@@ -95,37 +125,6 @@ where
         dm.set_as_af_output(AFType::OutputPushPull, Speed::High);
 
         T::enable_and_reset();
-
-        let regs = T::regs();
-
-        regs.ctrl().modify(|w| {
-            w.set_clr_all(true);
-            w.set_reset_sie(true);
-        });
-
-        embassy_time::block_for(embassy_time::Duration::from_micros(10));
-
-        regs.ctrl().modify(|w| {
-            w.0 = 0;
-        });
-
-        regs.int_en().write(|w| w.0 = 0);
-
-        regs.ctrl().modify(|w| {
-            w.set_int_busy(true);
-            w.set_dma_en(true);
-            w.set_dev_pu_en(true);
-        });
-
-        regs.uep_dma(0).write_value(ep_out_buffer[0].data.as_mut_ptr() as u32);
-
-        // RX(0) = ACK
-        regs.uep_rx_ctrl(0).write(|w| w.set_mask_r_res(0b00));
-        // TX(0) = NAK
-        regs.uep_tx_ctrl(0).write(|w| w.set_mask_t_res(0b10));
-
-        // Initialize the bus so that it signals that power is available
-        // usbd.rs does BUS_WAKER.wake(), but it doesn't seem necessary
 
         Self {
             phantom: PhantomData,
@@ -172,7 +171,54 @@ impl<'d, T: Instance> driver::Driver<'d> for Driver<'d, T> {
     }
 
     fn start(self, control_max_packet_size: u16) -> (Self::Bus, Self::ControlPipe) {
+        trace!("start");
         let regs = T::regs();
+
+        regs.ctrl().modify(|w| {
+            w.set_clr_all(true);
+            w.set_reset_sie(true);
+        });
+
+        embassy_time::block_for(embassy_time::Duration::from_micros(10));
+
+        regs.ctrl().modify(|w| {
+            w.0 = 0;
+        });
+
+        regs.int_en().write(|w| {
+            w.set_dev_nak(true);
+            w.set_fifo_ov(true);
+
+            // Host SOF is ignored, not our usecase here
+
+            // w.set_suspend(true);
+            w.set_transfer(true);
+            w.set_bus_rst(true);
+        });
+
+        regs.ctrl().modify(|w| {
+            w.set_int_busy(true);
+            w.set_dma_en(true);
+            w.set_dev_pu_en(true);
+        });
+
+        critical_section::with(|_cs| {
+            T::Interrupt::unpend();
+            unsafe {
+                T::Interrupt::enable();
+            }
+        });
+
+        regs.uep_dma(0)
+            .write_value(self.ep_out_buffer[0].data.as_mut_ptr() as u32);
+
+        // RX(0) = ACK
+        regs.uep_rx_ctrl(0).write(|w| w.set_mask_r_res(0b00));
+        // TX(0) = NAK
+        regs.uep_tx_ctrl(0).write(|w| w.set_mask_t_res(0b10));
+
+        // Initialize the bus so that it signals that power is available
+        // usbd.rs does BUS_WAKER.wake(), but it doesn't seem necessary
 
         let ep_out = Endpoint {
             _phantom: PhantomData,
@@ -302,18 +348,51 @@ where
     }
 
     async fn poll(&mut self) -> embassy_usb_driver::Event {
-        poll_fn(move |ctx| {
+        poll_fn(|ctx| {
             BUS_WAKER.register(ctx.waker());
-            trace!("polling");
+            trace!("poll");
 
+            // LOL VBUS detection
             if !self.inited {
                 self.inited = true;
                 return Poll::Ready(Event::PowerDetected);
             }
 
-            // Somehow detect a bus reset needs to happen
-            todo!();
+            let regs = T::regs();
+            let interrupt_flags = regs.int_fg().read();
+            let misc_status = regs.mis_st().read();
 
+            // Either Suspend or Resume has happened
+            if interrupt_flags.suspend() {
+                // Clear suspend flag
+                regs.int_fg().write(|v| v.set_suspend(true));
+
+                if misc_status.suspend() {
+                    trace!("Suspend");
+                    return Poll::Ready(Event::Suspend);
+                } else {
+                    trace!("resume");
+                    return Poll::Ready(Event::Resume);
+                }
+            }
+
+            // Somehow detect a bus reset needs to happen
+            // todo!();
+
+            // unsafe { T::Interrupt::enable() };
+            critical_section::with(|_| {
+                regs.int_fg().modify(|_| {});
+                trace!("Interrupt Enabled? {}", T::Interrupt::is_enabled());
+                trace!(
+                    "Pend? {}, IntFG: {:#x}, IntSt: {:#x}",
+                    T::Interrupt::is_pending(),
+                    regs.int_fg().read().0,
+                    regs.int_st().read().0,
+                );
+                unsafe { T::Interrupt::enable() };
+            });
+
+            trace!("Bus pend");
             Poll::Pending
         })
         .await
@@ -345,6 +424,8 @@ where
     }
 
     async fn setup(&mut self) -> [u8; 8] {
+        trace!("setup");
+        /*
         loop {
             let intfg = T::regs().int_fg().read();
             let status = T::regs().int_st().read();
@@ -371,6 +452,34 @@ where
             }
             T::regs().int_fg().write_value(intfg);
         }
+         */
+
+        let mut x = false;
+        poll_fn(move |ctx| {
+            BUS_WAKER.register(ctx.waker());
+
+            if !self.setup_state.setup_ready.load(Ordering::Acquire) {
+                self.setup_state.setup_ready.store(true, Ordering::Relaxed);
+            } else {
+            }
+
+            let regs = T::regs();
+            trace!(
+                "Interrupt?: {}, {}",
+                T::Interrupt::is_enabled(),
+                T::Interrupt::is_pending()
+            );
+            trace!(
+                "Pend? {}, IntFG: {:#x}, IntSt: {:#x}",
+                T::Interrupt::is_pending(),
+                regs.int_fg().read().0,
+                regs.int_st().read().0,
+            );
+
+            trace!("setup Pend");
+            Poll::Pending
+        })
+        .await
     }
 
     async fn data_out(&mut self, buf: &mut [u8], _first: bool, _last: bool) -> Result<usize, EndpointError> {
@@ -405,10 +514,7 @@ trait SealedInstance: RccPeripheral {
 /// I2C peripheral instance
 #[allow(private_bounds)]
 pub trait Instance: SealedInstance + 'static {
-    // /// Event interrupt for this instance
-    // type EventInterrupt: interrupt::typelevel::Interrupt;
-    // /// Error interrupt for this instance
-    // type ErrorInterrupt: interrupt::typelevel::Interrupt;
+    type Interrupt: interrupt::typelevel::Interrupt;
 }
 
 foreach_peripheral!(
@@ -427,8 +533,7 @@ foreach_peripheral!(
         }
 
         impl Instance for peripherals::$inst {
-            // type EventInterrupt = crate::_generated::peripheral_interrupts::$inst::EV;
-            // type ErrorInterrupt = crate::_generated::peripheral_interrupts::$inst::ER;
+            type Interrupt = crate::_generated::peripheral_interrupts::$inst::GLOBAL;
         }
     };
 );
