@@ -2,7 +2,7 @@ use core::cell::UnsafeCell;
 use core::future::poll_fn;
 use core::marker::PhantomData;
 use core::panic;
-use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{fence, AtomicBool, Ordering};
 use core::task::Poll;
 
 use ch32_metapac::otg::vals::{EpRxResponse, EpTxResponse, UsbToken};
@@ -21,7 +21,7 @@ use crate::{interrupt, peripherals, Peripheral, RccPeripheral};
 pub mod marker;
 
 const NR_EP: usize = 16;
-const MAX_EP_OUT_BUFFER: u16 = 64;
+const EP_MAX_PACKET_SIZE: u16 = 64;
 
 const NEW_AW: AtomicWaker = AtomicWaker::new();
 static BUS_WAKER: AtomicWaker = NEW_AW;
@@ -66,13 +66,14 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
                 let status = regs.int_st().read();
 
                 let token = status.mask_token();
-                trace!("[IRQ USBFS] Transfer Token: {:#x}", token.to_bits());
                 match token {
                     UsbToken::IN | UsbToken::OUT => {
                         let ep = status.mask_uis_endp();
-                        trace!("[IRQ USBFS] ep: {}", ep);
                         if ep == 0 {
                             EP0_WAKER.wake();
+                        } else {
+                            trace!("[IRQ USBFS] Transfer Token: {:#x}", token.to_bits());
+                            error!("Unexpected EP: {}", ep);
                         }
                     }
                     UsbToken::SETUP => {
@@ -130,7 +131,7 @@ struct EndpointData {
 #[repr(C, align(4))]
 #[derive(Clone, Copy)]
 pub struct EndpointDataBuffer {
-    data: [u8; MAX_EP_OUT_BUFFER as usize],
+    data: [u8; EP_MAX_PACKET_SIZE as usize],
 }
 
 impl Default for EndpointDataBuffer {
@@ -163,6 +164,8 @@ where
 
         T::enable_and_reset();
 
+        ep_out_buffer[0].data[0..16].copy_from_slice(&[69u8; 16]);
+
         Self {
             phantom: PhantomData,
             ep_alloc: [None; NR_EP],
@@ -170,11 +173,11 @@ where
             ep_out_buffer_next: 1,
             ep_0_in: EndpointData {
                 ep_type: EndpointType::Control,
-                max_packet_size: 64,
+                max_packet_size: EP_MAX_PACKET_SIZE,
             },
             ep_0_out: EndpointData {
                 ep_type: EndpointType::Control,
-                max_packet_size: 64,
+                max_packet_size: EP_MAX_PACKET_SIZE,
             },
         }
     }
@@ -208,19 +211,19 @@ impl<'d, T: Instance> driver::Driver<'d> for Driver<'d, T> {
     }
 
     fn start(self, control_max_packet_size: u16) -> (Self::Bus, Self::ControlPipe) {
+        assert!(control_max_packet_size <= EP_MAX_PACKET_SIZE);
         trace!("start");
         let regs = T::regs();
 
-        regs.ctrl().modify(|w| {
+        regs.ctrl().write(|w| {
             w.set_clr_all(true);
             w.set_reset_sie(true);
         });
 
         embassy_time::block_for(embassy_time::Duration::from_micros(10));
 
-        regs.ctrl().modify(|w| {
-            w.0 = 0;
-        });
+        // Clear all
+        regs.ctrl().write(|_| {});
 
         regs.int_en().write(|w| {
             // w.set_dev_nak(true);
@@ -233,7 +236,7 @@ impl<'d, T: Instance> driver::Driver<'d> for Driver<'d, T> {
             w.set_bus_rst(true);
         });
 
-        regs.ctrl().modify(|w| {
+        regs.ctrl().write(|w| {
             w.set_int_busy(true);
             w.set_dma_en(true);
             w.set_dev_pu_en(true);
@@ -245,9 +248,23 @@ impl<'d, T: Instance> driver::Driver<'d> for Driver<'d, T> {
         regs.uep_rx_ctrl(0).write(|w| w.set_mask_r_res(EpRxResponse::ACK));
         regs.uep_tx_ctrl(0).write(|w| w.set_mask_t_res(EpTxResponse::NAK));
 
+        // Hookup the bus on start?
+        regs.udev_ctrl().write(|w| {
+            // pd is for HOST
+            w.set_pd_dis(true);
+            w.set_port_en(true);
+        });
+
         // Initialize the bus so that it signals that power is available
         // usbd.rs does BUS_WAKER.wake(), but it doesn't seem necessary
         BUS_WAKER.wake();
+
+        critical_section::with(|_cs| {
+            T::Interrupt::unpend();
+            unsafe {
+                T::Interrupt::enable();
+            }
+        });
 
         let ep_out = Endpoint {
             _phantom: PhantomData,
@@ -270,21 +287,6 @@ impl<'d, T: Instance> driver::Driver<'d> for Driver<'d, T> {
             },
             buffer: None,
         };
-
-        // Hookup the bus on start?
-        regs.udev_ctrl().write(|w| {
-            // different from reference code
-            // board has no pulldown
-            w.set_pd_dis(false);
-            w.set_port_en(true);
-        });
-
-        critical_section::with(|_cs| {
-            T::Interrupt::unpend();
-            unsafe {
-                T::Interrupt::enable();
-            }
-        });
 
         (
             Bus {
@@ -399,13 +401,14 @@ where
                         v.set_mask_usb_addr(0);
                     });
 
+                    // Reset endpoint state on bus reset
                     regs.uep_rx_ctrl(0).write(|v| v.set_mask_r_res(EpRxResponse::ACK));
                     regs.uep_tx_ctrl(0).write(|v| v.set_mask_t_res(EpTxResponse::NAK));
 
                     regs.int_fg().write(|v| {
                         v.set_bus_rst(true);
                         // Also clear transfer?
-                        v.set_transfer(true);
+                        // v.set_transfer(true);
                     });
 
                     return Poll::Ready(Event::Reset);
@@ -439,12 +442,12 @@ where
     T: Instance,
 {
     fn max_packet_size(&self) -> usize {
-        usize::from(MAX_EP_OUT_BUFFER)
+        usize::from(EP_MAX_PACKET_SIZE)
     }
 
     async fn setup(&mut self) -> [u8; 8] {
+        trace!("setup");
         poll_fn(move |ctx| {
-            trace!("setup poll");
             EP0_WAKER.register(ctx.waker());
             critical_section::with(|_| {
                 unsafe { T::Interrupt::enable() };
@@ -466,7 +469,11 @@ where
                                 w.set_mask_r_res(EpRxResponse::NAK);
                             });
                             let mut data = [0u8; 8];
+
+                            // Should be acquire
+                            fence(Ordering::SeqCst);
                             data.copy_from_slice(&self.buffer.data[0..8]);
+                            fence(Ordering::SeqCst);
 
                             // Clear Flag
                             regs.int_fg().write(|v| v.set_transfer(true));
@@ -488,11 +495,127 @@ where
         .await
     }
 
-    async fn data_out(&mut self, buf: &mut [u8], _first: bool, _last: bool) -> Result<usize, EndpointError> {
-        todo!()
+    async fn data_out(&mut self, buf: &mut [u8], first: bool, last: bool) -> Result<usize, EndpointError> {
+        trace!("data_out");
+        assert!(buf.len() <= EP_MAX_PACKET_SIZE as usize, "out buf too large");
+        assert!(first && last, "TODO support chunking");
+
+        let regs = T::regs();
+
+        // Tx Ctrl should be NAK
+
+        assert!(!regs.int_fg().read().transfer(), "transfer should not be pending");
+
+        // Really.... unnessrary but lollll
+        // Should be release
+        fence(Ordering::SeqCst);
+
+        regs.uep_rx_ctrl(0).write(|v| {
+            v.set_r_tog(true);
+            v.set_mask_r_res(EpRxResponse::ACK);
+        });
+
+        // poll for packet
+        let bytes_read = poll_fn(|ctx| {
+            EP0_WAKER.register(ctx.waker());
+
+            let ret = if regs.int_fg().read().transfer() {
+                let status = regs.int_st().read();
+                if status.mask_uis_endp() != 0 {
+                    // Unexpected
+                    regs.int_fg().write(|v| v.set_transfer(true));
+                    error!("Expected STATUS stage saw non ep0, aborting");
+                    Poll::Ready(Err(EndpointError::Disabled))
+                } else {
+                    let token = status.mask_token();
+                    trace!("[IRQ USBFS] Transfer Token: {:#x}", token.to_bits());
+
+                    let ret = match token {
+                        UsbToken::RSVD | UsbToken::IN => unreachable!(),
+                        UsbToken::SETUP => Poll::Ready(Err(EndpointError::Disabled)),
+                        UsbToken::OUT => {
+                            // upper bits are reserved (0)
+                            // TODO fix metapac
+                            let len = regs.rx_len().read().0 as usize;
+                            // TODO debug assert
+                            // https://github.com/embassy-rs/embassy/blob/6e0b08291b63a0da8eba9284869d1d046bc5dabb/embassy-usb/src/lib.rs#L408
+                            assert_eq!(len, buf.len());
+                            if len != buf.len() {
+                                Poll::Ready(Err(EndpointError::BufferOverflow))
+                            } else {
+                                // Should be Acquire
+                                fence(Ordering::SeqCst);
+                                buf.copy_from_slice(&self.buffer.data[..len]);
+                                Poll::Ready(Ok(len))
+                            }
+                        }
+                    };
+
+                    regs.int_fg().write(|v| v.set_transfer(true));
+                    ret
+                }
+            } else {
+                Poll::Pending
+            };
+            unsafe { T::Interrupt::enable() };
+            ret
+        })
+        .await?;
+
+        regs.uep_rx_ctrl(0).write(|v| {
+            v.set_r_tog(true);
+            v.set_mask_r_res(EpRxResponse::NAK);
+        });
+
+        regs.uep_t_len(0).write_value(0);
+        regs.uep_tx_ctrl(0).write(|v| {
+            v.set_t_tog(true);
+            v.set_mask_t_res(EpTxResponse::ACK);
+        });
+
+        // TODO clean up/decide critical section
+        poll_fn(|ctx| {
+            EP0_WAKER.register(ctx.waker());
+            critical_section::with(|_| {
+                unsafe { T::Interrupt::enable() };
+
+                if regs.int_fg().read().transfer() {
+                    let status = regs.int_st().read();
+                    if status.mask_uis_endp() != 0 {
+                        // Unexpected
+                        regs.int_fg().write(|v| v.set_transfer(true));
+                        error!("Expected STATUS stage saw non ep0, aborting");
+                        return Poll::Ready(Err(EndpointError::Disabled));
+                    }
+                    if status.mask_token() == UsbToken::IN {
+                        if regs.rx_len().read().0 != 0 {
+                            error!("Expected 0 len OUT stage, found non-zero len, aborting");
+                            return Poll::Ready(Err(EndpointError::Disabled));
+                        }
+                        // Set the EP back to NAK so that we are "not ready to recieve"
+                        regs.uep_tx_ctrl(0).write(|v| {
+                            v.set_t_tog(true);
+                            v.set_mask_t_res(EpTxResponse::NAK);
+                        });
+                        regs.int_fg().write(|v| v.set_transfer(true));
+                        Poll::Ready(Ok(()))
+                    } else {
+                        regs.int_fg().write(|v| v.set_transfer(true));
+                        Poll::Ready(Err(EndpointError::Disabled))
+                    }
+                } else {
+                    Poll::Pending
+                }
+            })
+        })
+        .await?;
+
+        trace!("data_out: (hex) {:x}", buf[..bytes_read]);
+        Ok(bytes_read)
     }
 
     async fn data_in(&mut self, data: &[u8], first: bool, last: bool) -> Result<(), EndpointError> {
+        trace!("data_in: (hex) {:x}", data);
         let regs = T::regs();
 
         if data.len() > self.ep_in.info.max_packet_size as usize {
@@ -501,32 +624,19 @@ where
 
         assert!(first && last, "TODO, handle other cases");
 
-        regs.uep_rx_ctrl(0).modify(|v| {
-            // Mark the RX endpoint as "STALL", because we can't really do
-            // anything, the EP buffer will be occupied by the out going data.
-            v.set_mask_r_res(EpRxResponse::NAK);
-        });
-
-        poll_fn(|ctx| {
-            EP0_WAKER.register(ctx.waker());
-            critical_section::with(|_| {
-                unsafe {
-                    T::Interrupt::enable();
-                }
-                let uep_tx_ctl0 = regs.uep_tx_ctrl(0).read();
-                trace!("tx: {:#b}", uep_tx_ctl0.0);
-                if uep_tx_ctl0.mask_t_res() == EpTxResponse::NAK {
-                    Poll::Ready(())
-                } else {
-                    Poll::Pending
-                }
-            })
-        })
-        .await;
-        trace!("ready");
+        // AFAIK this is already true
+        // regs.uep_rx_ctrl(0).write(|v| {
+        //     // Mark the RX endpoint as "NAK", because we can't really do
+        //     // anything, the EP buffer will be occupied by the out going data.
+        //     v.set_mask_r_res(EpRxResponse::NAK);
+        // });
 
         // Deposit data in dma buffer
         self.buffer.data[..data.len()].copy_from_slice(data);
+
+        // Should be release
+        fence(Ordering::SeqCst);
+
         // TODO: manual is wrong here, t_len(3) should be a u16
         regs.uep_t_len(0).write_value(data.len() as u8);
 
@@ -541,9 +651,7 @@ where
             // Poll for last packet to finsh transfer
             poll_fn(|ctx| {
                 EP0_WAKER.register(ctx.waker());
-                critical_section::with(|_| {
-                    unsafe { T::Interrupt::enable() };
-
+                let poll_result = {
                     let int_flags = regs.int_fg().read();
                     if int_flags.transfer() {
                         let status = regs.int_st().read();
@@ -551,70 +659,76 @@ where
                         if status.mask_uis_endp() != 0 {
                             // Unexpected
                             error!("Expected STATUS stage saw non ep0, aborting");
-                            return Poll::Ready(Err(EndpointError::Disabled));
-                        }
-                        match status.mask_token() {
-                            UsbToken::OUT | UsbToken::RSVD => unreachable!(),
-                            UsbToken::IN => {
-                                trace!("txctl resp: {:#x}", regs.uep_tx_ctrl(0).read().mask_t_res().to_bits());
-                                regs.uep_tx_ctrl(0).write(|v| {
-                                    v.set_mask_t_res(EpTxResponse::NAK);
-                                });
-                                regs.uep_rx_ctrl(0).write(|v| {
-                                    // Set RX to true to expect the STATUS (OUT) packet
-                                    v.set_mask_r_res(EpRxResponse::ACK);
-                                    v.set_r_tog(true);
-                                });
-                                regs.int_fg().write(|v| v.set_transfer(true));
-                                Poll::Ready(Ok(()))
-                            }
-                            UsbToken::SETUP => {
-                                error!("SETUP while data_in, aborting");
-                                // TODO: unsure
-                                // regs.int_fg().write(|v| v.set_transfer(true));
-                                Poll::Ready(Err(EndpointError::Disabled))
+                            Poll::Ready(Err(EndpointError::Disabled))
+                        } else {
+                            match status.mask_token() {
+                                UsbToken::OUT | UsbToken::RSVD => unreachable!(),
+                                UsbToken::IN => {
+                                    fence(Ordering::SeqCst);
+                                    trace!("huh: {:X}", self.buffer.data[..data.len()]);
+                                    regs.uep_tx_ctrl(0).write(|v| {
+                                        v.set_t_tog(true);
+                                        v.set_mask_t_res(EpTxResponse::NAK);
+                                    });
+                                    regs.uep_rx_ctrl(0).write(|v| {
+                                        // Set RX to true to expect the STATUS (OUT) packet
+                                        v.set_mask_r_res(EpRxResponse::ACK);
+                                        v.set_r_tog(true);
+                                    });
+                                    regs.int_fg().write(|v| v.set_transfer(true));
+                                    Poll::Ready(Ok(()))
+                                }
+                                UsbToken::SETUP => {
+                                    error!("SETUP while data_in, aborting");
+                                    // TODO: unsure
+                                    // regs.int_fg().write(|v| v.set_transfer(true));
+                                    Poll::Ready(Err(EndpointError::Disabled))
+                                }
                             }
                         }
                     } else {
                         Poll::Pending
                     }
-                })
+                };
+                unsafe { T::Interrupt::enable() };
+                poll_result
             })
             .await?;
 
             // Expect the empty OUT token for status
             poll_fn(|ctx| {
                 EP0_WAKER.register(ctx.waker());
-                critical_section::with(|_| {
-                    unsafe { T::Interrupt::enable() };
 
-                    if regs.int_fg().read().transfer() {
-                        let status = regs.int_st().read();
-                        if status.mask_uis_endp() != 0 {
-                            // Unexpected
-                            regs.int_fg().write(|v| v.set_transfer(true));
-                            error!("Expected STATUS stage saw non ep0, aborting");
+                let poll_res = if regs.int_fg().read().transfer() {
+                    let status = regs.int_st().read();
+                    let res = if status.mask_uis_endp() != 0 {
+                        // Unexpected
+                        error!("Expected STATUS stage saw non ep0, aborting");
+                        Poll::Ready(Err(EndpointError::Disabled))
+                    } else if status.mask_token() == UsbToken::OUT {
+                        if regs.rx_len().read().0 != 0 {
+                            error!("Expected 0 len OUT stage, found non-zero len, aborting");
                             return Poll::Ready(Err(EndpointError::Disabled));
                         }
-                        if status.mask_token() == UsbToken::OUT {
-                            if regs.rx_len().read().0 != 0 {
-                                error!("Expected 0 len OUT stage, found non-zero len, aborting");
-                                return Poll::Ready(Err(EndpointError::Disabled));
-                            }
-                            // Set the EP back to NAK so that we are "not ready to recieve"
-                            regs.uep_rx_ctrl(0).write(|v| {
-                                v.set_mask_r_res(EpRxResponse::NAK);
-                            });
-                            regs.int_fg().write(|v| v.set_transfer(true));
-                            Poll::Ready(Ok(()))
-                        } else {
-                            regs.int_fg().write(|v| v.set_transfer(true));
-                            Poll::Ready(Err(EndpointError::Disabled))
-                        }
+                        // Set the EP back to NAK so that we are "not ready to recieve"
+                        regs.uep_rx_ctrl(0).write(|v| {
+                            v.set_r_tog(true);
+                            v.set_mask_r_res(EpRxResponse::NAK);
+                        });
+                        Poll::Ready(Ok(()))
                     } else {
-                        Poll::Pending
-                    }
-                })
+                        error!("Got {} instead of OUT token", status.mask_token().to_bits());
+                        Poll::Ready(Err(EndpointError::Disabled))
+                    };
+                    regs.int_fg().write(|v| v.set_transfer(true));
+                    res
+                } else {
+                    Poll::Pending
+                };
+
+                unsafe { T::Interrupt::enable() };
+
+                poll_res
             })
             .await?;
         }
@@ -625,17 +739,62 @@ where
     }
 
     async fn accept(&mut self) {
-        todo!()
+        trace!("accept");
+        let regs = T::regs();
+
+        // Rx should already be NAK
+        regs.uep_t_len(0).write_value(0);
+        regs.uep_tx_ctrl(0).write(|v| {
+            v.set_t_tog(true);
+            v.set_mask_t_res(EpTxResponse::ACK);
+        });
+
+        poll_fn(|ctx| {
+            EP0_WAKER.register(ctx.waker());
+
+            let res = if regs.int_fg().read().transfer() {
+                let status = regs.int_st().read();
+                assert_eq!(status.mask_uis_endp(), 0);
+                match status.mask_token() {
+                    UsbToken::IN => {
+                        // Maybe stall? and unstall when we actually set addr
+                        regs.uep_tx_ctrl(0).write(|v| {
+                            v.set_mask_t_res(EpTxResponse::NAK);
+                            v.set_t_tog(true);
+                        });
+                        regs.int_fg().write(|v| v.set_transfer(true));
+                    }
+                    UsbToken::OUT | UsbToken::RSVD | UsbToken::SETUP => panic!(),
+                }
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            };
+            unsafe { T::Interrupt::enable() };
+            res
+        })
+        .await;
     }
 
     async fn reject(&mut self) {
-        todo!()
+        // Untested, unsure how to test
+        let regs = T::regs();
+        regs.uep_rx_ctrl(0).write(|v| {
+            v.set_mask_r_res(EpRxResponse::STALL);
+        });
+        regs.uep_tx_ctrl(0).write(|v| {
+            v.set_mask_t_res(EpTxResponse::STALL);
+        });
     }
 
     async fn accept_set_address(&mut self, addr: u8) {
+        // That's it ?
+        trace!("Accept addr: {}", addr);
         self.accept().await;
-        trace!("[CP]: set addr: {}", addr);
-        todo!()
+        T::regs().dev_ad().write(|v| {
+            v.set_mask_usb_addr(addr);
+        });
+        trace!("address accepted");
     }
 }
 
