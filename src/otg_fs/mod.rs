@@ -377,9 +377,7 @@ where
             BUS_WAKER.register(ctx.waker());
             trace!("bus poll");
 
-            critical_section::with(|_| {
-                unsafe { T::Interrupt::enable() };
-
+            let poll_res = {
                 let regs = T::regs();
                 let interrupt_flags = regs.int_fg().read();
 
@@ -389,13 +387,11 @@ where
                     regs.int_fg().write(|v| v.set_suspend(true));
 
                     if regs.mis_st().read().suspend() {
-                        return Poll::Ready(Event::Suspend);
+                        Poll::Ready(Event::Suspend)
                     } else {
-                        return Poll::Ready(Event::Resume);
+                        Poll::Ready(Event::Resume)
                     }
-                }
-
-                if interrupt_flags.bus_rst() {
+                } else if interrupt_flags.bus_rst() {
                     trace!("bus: reset");
                     regs.dev_ad().write(|v| {
                         v.set_mask_usb_addr(0);
@@ -407,15 +403,15 @@ where
 
                     regs.int_fg().write(|v| {
                         v.set_bus_rst(true);
-                        // Also clear transfer?
-                        // v.set_transfer(true);
                     });
 
-                    return Poll::Ready(Event::Reset);
+                    Poll::Ready(Event::Reset)
+                } else {
+                    Poll::Pending
                 }
-
-                Poll::Pending
-            })
+            };
+            unsafe { T::Interrupt::enable() };
+            poll_res
         })
         .await
     }
@@ -449,15 +445,12 @@ where
         trace!("setup");
         poll_fn(move |ctx| {
             EP0_WAKER.register(ctx.waker());
-            critical_section::with(|_| {
-                unsafe { T::Interrupt::enable() };
-
+            let poll_result = {
                 let regs = T::regs();
-                let int_flags = regs.int_fg().read();
-                if int_flags.transfer() {
+                if regs.int_fg().read().transfer() {
                     let int_status = regs.int_st().read();
 
-                    match int_status.mask_token() {
+                    let transfer_res = match int_status.mask_token() {
                         UsbToken::SETUP => {
                             // SETUP packet token
                             regs.uep_tx_ctrl(0).write(|w| {
@@ -476,8 +469,7 @@ where
                             fence(Ordering::SeqCst);
 
                             // Clear Flag
-                            regs.int_fg().write(|v| v.set_transfer(true));
-                            return Poll::Ready(data);
+                            Poll::Ready(data)
                         }
                         _ => {
                             error!(
@@ -487,15 +479,21 @@ where
                             );
                             panic!()
                         }
-                    }
+                    };
+                    regs.int_fg().write(|v| v.set_transfer(true));
+                    transfer_res
+                } else {
+                    Poll::Pending
                 }
-                Poll::Pending
-            })
+            };
+            unsafe { T::Interrupt::enable() };
+            poll_result
         })
         .await
     }
 
     async fn data_out(&mut self, buf: &mut [u8], first: bool, last: bool) -> Result<usize, EndpointError> {
+        panic!();
         trace!("data_out");
         assert!(buf.len() <= EP_MAX_PACKET_SIZE as usize, "out buf too large");
         assert!(first && last, "TODO support chunking");
@@ -573,40 +571,41 @@ where
             v.set_mask_t_res(EpTxResponse::ACK);
         });
 
-        // TODO clean up/decide critical section
         poll_fn(|ctx| {
             EP0_WAKER.register(ctx.waker());
-            critical_section::with(|_| {
-                unsafe { T::Interrupt::enable() };
-
+            let poll_res = {
                 if regs.int_fg().read().transfer() {
                     let status = regs.int_st().read();
-                    if status.mask_uis_endp() != 0 {
-                        // Unexpected
-                        regs.int_fg().write(|v| v.set_transfer(true));
-                        error!("Expected STATUS stage saw non ep0, aborting");
-                        return Poll::Ready(Err(EndpointError::Disabled));
-                    }
-                    if status.mask_token() == UsbToken::IN {
-                        if regs.rx_len().read().0 != 0 {
-                            error!("Expected 0 len OUT stage, found non-zero len, aborting");
-                            return Poll::Ready(Err(EndpointError::Disabled));
+                    assert_eq!(status.mask_uis_endp(), 0, "Not EP0");
+                    let transfer_res = {
+                        if status.mask_uis_endp() != 0 {
+                            // Unexpected
+                            error!("Expected STATUS stage saw non ep0, aborting");
+                            Poll::Ready(Err(EndpointError::Disabled))
+                        } else if status.mask_token() == UsbToken::IN {
+                            if regs.rx_len().read().0 != 0 {
+                                error!("Expected 0 len OUT stage, found non-zero len, aborting");
+                                Poll::Ready(Err(EndpointError::Disabled))
+                            } else {
+                                // Set the EP back to NAK so that we are "not ready to recieve"
+                                regs.uep_tx_ctrl(0).write(|v| {
+                                    v.set_t_tog(true);
+                                    v.set_mask_t_res(EpTxResponse::NAK);
+                                });
+                                Poll::Ready(Ok(()))
+                            }
+                        } else {
+                            Poll::Ready(Err(EndpointError::Disabled))
                         }
-                        // Set the EP back to NAK so that we are "not ready to recieve"
-                        regs.uep_tx_ctrl(0).write(|v| {
-                            v.set_t_tog(true);
-                            v.set_mask_t_res(EpTxResponse::NAK);
-                        });
-                        regs.int_fg().write(|v| v.set_transfer(true));
-                        Poll::Ready(Ok(()))
-                    } else {
-                        regs.int_fg().write(|v| v.set_transfer(true));
-                        Poll::Ready(Err(EndpointError::Disabled))
-                    }
+                    };
+                    regs.int_fg().write(|v| v.set_transfer(true));
+                    transfer_res
                 } else {
                     Poll::Pending
                 }
-            })
+            };
+            unsafe { T::Interrupt::enable() };
+            poll_res
         })
         .await?;
 
@@ -646,6 +645,7 @@ where
             v.set_t_tog(true);
         });
 
+        // TODO: this is potentially wrong, we should wait for finish even for not last packet
         // Last packet we need to wait for it to finish
         if last {
             // Poll for last packet to finsh transfer
@@ -708,14 +708,15 @@ where
                     } else if status.mask_token() == UsbToken::OUT {
                         if regs.rx_len().read().0 != 0 {
                             error!("Expected 0 len OUT stage, found non-zero len, aborting");
-                            return Poll::Ready(Err(EndpointError::Disabled));
+                            Poll::Ready(Err(EndpointError::Disabled))
+                        } else {
+                            // Set the EP back to NAK so that we are "not ready to recieve"
+                            regs.uep_rx_ctrl(0).write(|v| {
+                                v.set_r_tog(true);
+                                v.set_mask_r_res(EpRxResponse::NAK);
+                            });
+                            Poll::Ready(Ok(()))
                         }
-                        // Set the EP back to NAK so that we are "not ready to recieve"
-                        regs.uep_rx_ctrl(0).write(|v| {
-                            v.set_r_tog(true);
-                            v.set_mask_r_res(EpRxResponse::NAK);
-                        });
-                        Poll::Ready(Ok(()))
                     } else {
                         error!("Got {} instead of OUT token", status.mask_token().to_bits());
                         Poll::Ready(Err(EndpointError::Disabled))
