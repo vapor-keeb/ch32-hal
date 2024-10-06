@@ -34,11 +34,6 @@ pub struct InterruptHandler<T: Instance> {
     _phantom: PhantomData<T>,
 }
 
-#[qingke_rt::interrupt]
-unsafe fn OTG_FS() {
-    InterruptHandler::<OTG_FS>::on_interrupt();
-}
-
 /* Interrupt Handlers
 
    AFAICT, LP is triggered for **ALL** events, and HP is only triggered on
