@@ -129,7 +129,6 @@ struct EndpointData {
 }
 
 #[repr(C, align(4))]
-#[derive(Clone, Copy)]
 pub struct EndpointDataBuffer {
     data: [u8; EP_MAX_PACKET_SIZE as usize],
 }
@@ -140,6 +139,26 @@ impl Default for EndpointDataBuffer {
             EndpointDataBuffer {
                 data: core::mem::zeroed(),
             }
+        }
+    }
+}
+
+impl EndpointDataBuffer {
+    fn read_volatile(&self, buf: &mut [u8]) {
+        assert!(buf.len() <= self.data.len());
+        let len = buf.len();
+
+        for i in 0..len {
+            buf[i] = unsafe { core::ptr::read_volatile(&self.data[i]) };
+        }
+    }
+
+    fn write_volatile(&mut self, buf: &[u8]) {
+        assert!(buf.len() <= self.data.len());
+        let len = buf.len();
+
+        for i in 0..len {
+            unsafe { core::ptr::write_volatile(&mut self.data[i], buf[i]) };
         }
     }
 }
@@ -163,8 +182,6 @@ where
         dm.set_as_af_output(AFType::OutputPushPull, Speed::High);
 
         T::enable_and_reset();
-
-        ep_out_buffer[0].data[0..16].copy_from_slice(&[69u8; 16]);
 
         Self {
             phantom: PhantomData,
@@ -465,7 +482,7 @@ where
 
                             // Should be acquire
                             fence(Ordering::SeqCst);
-                            data.copy_from_slice(&self.buffer.data[0..8]);
+                            self.buffer.read_volatile(&mut data[..8]);
                             fence(Ordering::SeqCst);
 
                             // Clear Flag
@@ -543,7 +560,7 @@ where
                             } else {
                                 // Should be Acquire
                                 fence(Ordering::SeqCst);
-                                buf.copy_from_slice(&self.buffer.data[..len]);
+                                self.buffer.read_volatile(&mut buf[..len]);
                                 Poll::Ready(Ok(len))
                             }
                         }
@@ -631,7 +648,7 @@ where
         // });
 
         // Deposit data in dma buffer
-        self.buffer.data[..data.len()].copy_from_slice(data);
+        self.buffer.write_volatile(data);
 
         // Should be release
         fence(Ordering::SeqCst);
