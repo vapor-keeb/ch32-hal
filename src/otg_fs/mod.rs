@@ -2,25 +2,18 @@ use core::cell::UnsafeCell;
 use core::future::poll_fn;
 use core::marker::PhantomData;
 use core::panic;
-use core::sync::atomic::{fence, AtomicBool, Ordering};
+use core::sync::atomic::AtomicBool;
 use core::task::Poll;
 
-use ch32_metapac::exti::regs::Intfr;
 use ch32_metapac::otg::vals::{EpRxResponse, EpTxResponse, UsbToken};
-use ch32_metapac::usb::regs::EpType;
 use defmt::{debug, error, info, trace, warn};
 use embassy_sync::waitqueue::AtomicWaker;
-use embassy_time::{Duration, Timer};
-use embassy_usb_driver::{
-    self as driver, Direction, EndpointAddress, EndpointAllocError, EndpointError, EndpointIn, EndpointInfo,
-    EndpointType, Event,
-};
-use endpoint::{ControlPipe, Endpoint, EndpointBufferAllocator, EndpointData, EndpointDataBuffer};
+use embassy_usb_driver::{self as driver, Direction, EndpointAddress, EndpointInfo, EndpointType, Event};
+use endpoint::{ControlPipe, Endpoint, EndpointBufferAllocator, EndpointDataBuffer};
 use marker::{Dir, In, Out};
 
 use crate::gpio::{AFType, Speed};
-use crate::interrupt::typelevel::{Handler, Interrupt};
-use crate::peripherals::OTG_FS;
+use crate::interrupt::typelevel::Interrupt;
 use crate::{interrupt, peripherals, Peripheral, RccPeripheral};
 
 pub mod endpoint;
@@ -71,8 +64,7 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
                         let ep = status.mask_uis_endp();
 
                         if ep as usize >= MAX_NR_EP {
-                            trace!("[IRQ USBFS] Transfer Token: {:#x}", token.to_bits());
-                            error!("Unexpected EP: {}", ep);
+                            error!("[USBFS] Unexpected EP: {} got token: {:#x}", ep, token.to_bits());
                         } else {
                             EP_WAKERS[ep as usize].wake();
                         }
@@ -95,24 +87,6 @@ struct ControlPipeSetupState {
     setup_data: UnsafeCell<[u8; 8]>,
     setup_ready: AtomicBool,
 }
-
-struct State {
-    control_state: ControlPipeSetupState,
-}
-
-impl State {
-    const fn new() -> Self {
-        State {
-            control_state: ControlPipeSetupState {
-                setup_data: UnsafeCell::new([0u8; 8]),
-                setup_ready: AtomicBool::new(false),
-            },
-        }
-    }
-}
-
-unsafe impl Send for State {}
-unsafe impl Sync for State {}
 
 pub struct Driver<'d, T: Instance, const NR_EP: usize> {
     phantom: PhantomData<&'d mut T>,
@@ -419,7 +393,6 @@ pin_trait!(DmPin, Instance);
 
 trait SealedInstance: RccPeripheral {
     fn regs() -> crate::pac::otg::Usbd;
-    fn state() -> &'static State;
 }
 
 /// I2C peripheral instance
@@ -434,12 +407,6 @@ foreach_peripheral!(
             fn regs() -> crate::pac::otg::Usbd {
                 // datasheet
                 unsafe { crate::pac::otg::Usbd::from_ptr(crate::pac::OTG_FS.as_ptr()) }
-            }
-
-            fn state() -> &'static State {
-                static STATE: State = State::new();
-
-                &STATE
             }
         }
 
