@@ -19,7 +19,8 @@ use crate::{interrupt, peripherals, Peripheral, RccPeripheral};
 pub mod endpoint;
 pub mod marker;
 
-const MAX_NR_EP: usize = 16;
+// TODO: We technically support 16, but we only allow 8 for now (0, 1-7).
+const MAX_NR_EP: usize = 7;
 const EP_MAX_PACKET_SIZE: u16 = 64;
 
 const NEW_AW: AtomicWaker = AtomicWaker::new();
@@ -188,6 +189,8 @@ impl<'d, T: Instance, const NR_EP: usize> driver::Driver<'d> for Driver<'d, T, N
         trace!("start");
         let regs = T::regs();
 
+        regs.uep_rx_ctrl(0).write(|v| v.set_mask_r_res(EpRxResponse::NAK));
+
         regs.ctrl().write(|w| {
             w.set_clr_all(true);
             w.set_reset_sie(true);
@@ -197,6 +200,8 @@ impl<'d, T: Instance, const NR_EP: usize> driver::Driver<'d> for Driver<'d, T, N
 
         // Clear all
         regs.ctrl().write(|_| {});
+
+        info!("value is {}", regs.uep_rx_ctrl(0).read().mask_r_res().to_bits());
 
         regs.int_en().write(|w| {
             // w.set_dev_nak(true);
@@ -255,6 +260,28 @@ pub struct Bus<'d, T> {
     inited: bool,
 }
 
+impl<'d, T: Instance> Bus<'d, T> {
+    fn bus_reset(&mut self) {
+        let regs = T::regs();
+
+        // Reset device address
+        regs.dev_ad().write(|v| {
+            v.set_mask_usb_addr(0);
+        });
+
+        // Reset endpoint state on bus reset
+        // EP0 get ACK/NAK so it can recieve setup
+        regs.uep_rx_ctrl(0).write(|v| v.set_mask_r_res(EpRxResponse::ACK));
+        regs.uep_tx_ctrl(0).write(|v| v.set_mask_t_res(EpTxResponse::NAK));
+
+        // Mark all other EPs as NAK
+        for i in 1..=7 {
+            regs.uep_rx_ctrl(i).write(|v| v.set_mask_r_res(EpRxResponse::NAK));
+            regs.uep_tx_ctrl(i).write(|v| v.set_mask_t_res(EpTxResponse::NAK));
+        }
+    }
+}
+
 impl<'d, T> driver::Bus for Bus<'d, T>
 where
     T: Instance,
@@ -295,13 +322,7 @@ where
                     }
                 } else if interrupt_flags.bus_rst() {
                     trace!("bus: reset");
-                    regs.dev_ad().write(|v| {
-                        v.set_mask_usb_addr(0);
-                    });
-
-                    // Reset endpoint state on bus reset
-                    regs.uep_rx_ctrl(0).write(|v| v.set_mask_r_res(EpRxResponse::ACK));
-                    regs.uep_tx_ctrl(0).write(|v| v.set_mask_t_res(EpTxResponse::NAK));
+                    self.bus_reset();
 
                     regs.int_fg().write(|v| {
                         v.set_bus_rst(true);
@@ -319,7 +340,20 @@ where
     }
 
     fn endpoint_set_enabled(&mut self, ep_addr: EndpointAddress, enabled: bool) {
+        debug!(
+            "[USBFS] Endpoint: {}, {}: Set enable={}",
+            ep_addr.index(),
+            ep_addr.direction(),
+            enabled
+        );
         let regs = T::regs();
+        // let reg_index = match ep_addr.index() {
+        //     0..=7 => ep_addr.index(),
+        //     8 => 4,
+        //     9..=15 => ep_addr.index() - 8,
+        //     _ => panic!(),
+        // };
+
         match (ep_addr.index(), ep_addr.direction()) {
             (4, Direction::In) => regs.uep4_1_mod().modify(|v| {
                 v.set_uep4_tx_en(enabled);
