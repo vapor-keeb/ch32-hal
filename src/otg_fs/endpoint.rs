@@ -2,12 +2,12 @@ use core::marker::PhantomData;
 use core::task::Poll;
 
 use ch32_metapac::otg::vals::{EpRxResponse, EpTxResponse, UsbToken};
-use defmt::{error, trace};
-use embassy_usb_driver::{EndpointAllocError, EndpointError, EndpointInfo};
+use defmt::{debug, error, trace};
+use embassy_usb_driver::{Direction, EndpointAllocError, EndpointError, EndpointInfo};
 use futures::future::poll_fn;
 
 use super::marker::{Dir, In, Out};
-use super::{Instance, EP_MAX_PACKET_SIZE};
+use super::{Instance, BUS_WAKER, EP_MAX_PACKET_SIZE, EP_WAKERS};
 use crate::interrupt::typelevel::Interrupt;
 
 pub struct EndpointBufferAllocator<'d, const NR_EP: usize> {
@@ -104,40 +104,75 @@ impl<'d, T: Instance, D: Dir> Endpoint<'d, T, D> {
             data,
         }
     }
+
+    async fn wait_enabled_internal(&mut self) {
+        poll_fn(|ctx| {
+            EP_WAKERS[self.info.addr.index() as usize].register(ctx.waker());
+            let regs = T::regs();
+            let enabled = self.is_enabled();
+            if enabled {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+        debug!("[USBFS] EP {} enabled", self.info.addr.index());
+    }
+
+    fn is_enabled(&self) -> bool {
+        let regs = T::regs();
+        match (self.info.addr.index(), self.info.addr.direction()) {
+            (4, Direction::In) => regs.uep4_1_mod().read().uep4_tx_en(),
+            (4, Direction::Out) => regs.uep4_1_mod().read().uep4_rx_en(),
+            (1, Direction::In) => regs.uep4_1_mod().read().uep1_tx_en(),
+            (1, Direction::Out) => regs.uep4_1_mod().read().uep1_rx_en(),
+
+            (2, Direction::In) => regs.uep2_3_mod().read().uep2_tx_en(),
+            (2, Direction::Out) => regs.uep2_3_mod().read().uep2_rx_en(),
+            (3, Direction::In) => regs.uep2_3_mod().read().uep3_tx_en(),
+            (3, Direction::Out) => regs.uep2_3_mod().read().uep3_rx_en(),
+
+            (5, Direction::In) => regs.uep5_6_mod().read().uep5_tx_en(),
+            (5, Direction::Out) => regs.uep5_6_mod().read().uep5_rx_en(),
+            (6, Direction::In) => regs.uep5_6_mod().read().uep6_tx_en(),
+            (6, Direction::Out) => regs.uep5_6_mod().read().uep6_rx_en(),
+
+            (7, Direction::In) => regs.uep7_mod().read().uep7_tx_en(),
+            (7, Direction::Out) => regs.uep7_mod().read().uep7_rx_en(),
+
+            _ => unreachable!(),
+        }
+    }
 }
 
-impl<'d, T: Instance> embassy_usb_driver::Endpoint for Endpoint<'d, T, In> {
+impl<'d, T: Instance, D: Dir> embassy_usb_driver::Endpoint for Endpoint<'d, T, D> {
     fn info(&self) -> &EndpointInfo {
         &self.info
     }
 
     async fn wait_enabled(&mut self) {
-        poll_fn(|_| Poll::Pending).await
-        // todo
+        self.wait_enabled_internal().await
     }
 }
 
 impl<'d, T: Instance> embassy_usb_driver::EndpointIn for Endpoint<'d, T, In> {
     async fn write(&mut self, buf: &[u8]) -> Result<(), EndpointError> {
-        Err(EndpointError::Disabled)
-    }
-}
-
-impl<'d, T: Instance> embassy_usb_driver::Endpoint for Endpoint<'d, T, Out> {
-    fn info(&self) -> &EndpointInfo {
-        &self.info
-    }
-
-    async fn wait_enabled(&mut self) {
-        poll_fn(|_| Poll::Pending).await
-        // todo
+        trace!("{} in read", self.info.addr);
+        if !self.is_enabled() {
+            return Err(EndpointError::Disabled);
+        }
+        todo!()
     }
 }
 
 impl<'d, T: Instance> embassy_usb_driver::EndpointOut for Endpoint<'d, T, Out> {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, EndpointError> {
         trace!("{} out read", self.info.addr);
-        Err(EndpointError::Disabled)
+        if !self.is_enabled() {
+            return Err(EndpointError::Disabled);
+        }
+        todo!()
     }
 }
 

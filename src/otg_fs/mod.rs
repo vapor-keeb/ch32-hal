@@ -320,7 +320,6 @@ where
 
     fn endpoint_set_enabled(&mut self, ep_addr: EndpointAddress, enabled: bool) {
         let regs = T::regs();
-
         match (ep_addr.index(), ep_addr.direction()) {
             (4, Direction::In) => regs.uep4_1_mod().modify(|v| {
                 v.set_uep4_tx_en(enabled);
@@ -373,6 +372,7 @@ where
                 panic!()
             }
         }
+        EP_WAKERS[ep_addr.index() as usize].wake();
     }
 
     fn endpoint_set_stalled(&mut self, ep_addr: EndpointAddress, stalled: bool) {

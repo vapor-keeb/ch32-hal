@@ -2,7 +2,7 @@ use embassy_usb_driver::Direction;
 
 
 /// USB Direction Trait
-pub(super) trait Dir {
+pub trait Dir {
     /// Returns the direction value.
     fn dir() -> Direction;
 }
