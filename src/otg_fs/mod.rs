@@ -40,7 +40,6 @@ pub struct InterruptHandler<T: Instance> {
 impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandler<T> {
     unsafe fn on_interrupt() {
         let regs = T::regs();
-        // Clear the host sof, we are in device mode.... It's garbage
         let int_fg = regs.int_fg().read();
 
         if int_fg.fifo_ov() {
@@ -78,6 +77,7 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
             }
         }
 
+        // Clear the host sof, we are in device mode.... It's garbage
         if int_fg.hst_sof() {
             regs.int_fg().write(|v| v.set_hst_sof(true));
         }
@@ -301,10 +301,10 @@ where
             self.inited = true;
             return Event::PowerDetected;
         }
+        trace!("bus poll");
 
         poll_fn(|ctx| {
             BUS_WAKER.register(ctx.waker());
-            trace!("bus poll");
 
             let poll_res = {
                 let regs = T::regs();
