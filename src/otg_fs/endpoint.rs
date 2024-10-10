@@ -170,7 +170,64 @@ impl<'d, T: Instance> embassy_usb_driver::EndpointOut for Endpoint<'d, T, Out> {
         if !self.is_enabled() {
             return Err(EndpointError::Disabled);
         }
-        todo!()
+
+        let ep = self.info.addr.index();
+        let regs = T::regs();
+
+        // Tx Ctrl should be NAK
+
+        regs.uep_rx_ctrl(ep).modify(|v| {
+            v.set_r_tog(!v.r_tog());
+            v.set_mask_r_res(EpRxResponse::ACK);
+        });
+
+        // poll for packet
+        let bytes_read = poll_fn(|ctx| {
+            super::EP_WAKERS[ep].register(ctx.waker());
+
+            let ret = if regs.int_fg().read().transfer() {
+                let status = regs.int_st().read();
+                if status.mask_uis_endp() as usize == ep {
+                    let token = status.mask_token();
+                    trace!("[IRQ USBFS] Transfer Token: {:#x}", token.to_bits());
+
+                    let ret = match token {
+                        UsbToken::RSVD | UsbToken::IN => unreachable!(),
+                        UsbToken::SETUP => Poll::Ready(Err(EndpointError::Disabled)),
+                        UsbToken::OUT => {
+                            // upper bits are reserved (0)
+                            // TODO fix metapac
+                            let len = regs.rx_len().read().0 as usize;
+                            // TODO debug assert
+                            // https://github.com/embassy-rs/embassy/blob/6e0b08291b63a0da8eba9284869d1d046bc5dabb/embassy-usb/src/lib.rs#L408
+                            assert_eq!(len, buf.len());
+                            if len != buf.len() {
+                                Poll::Ready(Err(EndpointError::BufferOverflow))
+                            } else {
+                                self.data.buffer.read_volatile(&mut buf[..len]);
+                                Poll::Ready(Ok(len))
+                            }
+                        }
+                    };
+
+                    regs.uep_rx_ctrl(ep).modify(|v| {
+                        v.set_mask_r_res(EpRxResponse::NAK);
+                    });
+                    regs.int_fg().write(|v| v.set_transfer(true));
+                    ret
+                } else {
+                    Poll::Pending
+                }
+            } else {
+                Poll::Pending
+            };
+            unsafe { T::Interrupt::enable() };
+            ret
+        })
+        .await?;
+
+        trace!("{:x}", buf);
+        Ok(bytes_read)
     }
 }
 
@@ -205,7 +262,10 @@ where
                 if regs.int_fg().read().transfer() {
                     let int_status = regs.int_st().read();
 
-                    let transfer_res = match int_status.mask_token() {
+                    // assume the setup packet is always for endpoint 0.
+                    // the hardware doesn't seem to set mask_uis_endp to 0
+                    // when the setup packet arrives.
+                    match int_status.mask_token() {
                         UsbToken::SETUP => {
                             // SETUP packet token
                             regs.uep_tx_ctrl(0).write(|w| {
@@ -218,20 +278,15 @@ where
 
                             self.ep0_buf.buffer.read_volatile(&mut data[..8]);
 
+                            regs.int_fg().write(|v| v.set_transfer(true));
                             // Clear Flag
                             Poll::Ready(data)
                         }
                         _ => {
-                            error!(
-                                "Unexpected packet: {}, len: {}",
-                                int_status.mask_token().to_bits(),
-                                regs.rx_len().read().rx_len()
-                            );
-                            panic!()
+                            assert_ne!(int_status.mask_uis_endp(), 0);
+                            Poll::Pending
                         }
-                    };
-                    regs.int_fg().write(|v| v.set_transfer(true));
-                    transfer_res
+                    }
                 } else {
                     Poll::Pending
                 }
@@ -265,12 +320,7 @@ where
 
             let ret = if regs.int_fg().read().transfer() {
                 let status = regs.int_st().read();
-                if status.mask_uis_endp() != 0 {
-                    // Unexpected
-                    regs.int_fg().write(|v| v.set_transfer(true));
-                    error!("Expected STATUS stage saw non ep0, aborting");
-                    Poll::Ready(Err(EndpointError::Disabled))
-                } else {
+                if status.mask_uis_endp() == 0 {
                     let token = status.mask_token();
                     trace!("[IRQ USBFS] Transfer Token: {:#x}", token.to_bits());
 
@@ -295,6 +345,8 @@ where
 
                     regs.int_fg().write(|v| v.set_transfer(true));
                     ret
+                } else {
+                    Poll::Pending
                 }
             } else {
                 Poll::Pending
