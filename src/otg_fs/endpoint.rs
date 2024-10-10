@@ -7,7 +7,7 @@ use embassy_usb_driver::{Direction, EndpointAllocError, EndpointError, EndpointI
 use futures::future::poll_fn;
 
 use super::marker::{Dir, In, Out};
-use super::{Instance, BUS_WAKER, EP_MAX_PACKET_SIZE, EP_WAKERS};
+use super::{Instance, EP_MAX_PACKET_SIZE, EP_WAKERS};
 use crate::interrupt::typelevel::Interrupt;
 
 pub struct EndpointBufferAllocator<'d, const NR_EP: usize> {
@@ -108,16 +108,14 @@ impl<'d, T: Instance, D: Dir> Endpoint<'d, T, D> {
     async fn wait_enabled_internal(&mut self) {
         poll_fn(|ctx| {
             EP_WAKERS[self.info.addr.index() as usize].register(ctx.waker());
-            let regs = T::regs();
-            let enabled = self.is_enabled();
-            if enabled {
+            if self.is_enabled() {
                 Poll::Ready(())
             } else {
                 Poll::Pending
             }
         })
         .await;
-        debug!("[USBFS] EP {} enabled", self.info.addr.index());
+        trace!("[USBFS] EP {} enabled", self.info.addr.index());
     }
 
     fn is_enabled(&self) -> bool {
@@ -355,12 +353,10 @@ where
         })
         .await?;
 
-        trace!("data_out: (hex) {:x}", buf[..bytes_read]);
         Ok(bytes_read)
     }
 
     async fn data_in(&mut self, data: &[u8], first: bool, last: bool) -> Result<(), EndpointError> {
-        trace!("data_in: (hex) {:x}", data);
         let regs = T::regs();
 
         if data.len() > self.ep0_buf.max_packet_size as usize {
