@@ -98,6 +98,9 @@ pub struct Endpoint<'d, T, D> {
 
 impl<'d, T: Instance, D: Dir> Endpoint<'d, T, D> {
     pub fn new(info: EndpointInfo, data: EndpointData<'d>) -> Self {
+        T::regs()
+            .uep_dma(info.addr.index() as usize)
+            .write_value(data.buffer.addr() as u32);
         Self {
             _phantom: PhantomData,
             info,
@@ -189,7 +192,7 @@ impl<'d, T: Instance> embassy_usb_driver::EndpointOut for Endpoint<'d, T, Out> {
                 let status = regs.int_st().read();
                 if status.mask_uis_endp() as usize == ep {
                     let token = status.mask_token();
-                    trace!("[IRQ USBFS] Transfer Token: {:#x}", token.to_bits());
+                    trace!("[USBFS] Transfer Token: {:#x}", token.to_bits());
 
                     let ret = match token {
                         UsbToken::RSVD | UsbToken::IN => unreachable!(),
@@ -200,12 +203,12 @@ impl<'d, T: Instance> embassy_usb_driver::EndpointOut for Endpoint<'d, T, Out> {
                             let len = regs.rx_len().read().0 as usize;
                             // TODO debug assert
                             // https://github.com/embassy-rs/embassy/blob/6e0b08291b63a0da8eba9284869d1d046bc5dabb/embassy-usb/src/lib.rs#L408
-                            assert_eq!(len, buf.len());
-                            if len != buf.len() {
-                                Poll::Ready(Err(EndpointError::BufferOverflow))
-                            } else {
+                            debug_assert_eq!(len, buf.len());
+                            if len == buf.len() {
                                 self.data.buffer.read_volatile(&mut buf[..len]);
                                 Poll::Ready(Ok(len))
+                            } else {
+                                Poll::Ready(Err(EndpointError::BufferOverflow))
                             }
                         }
                     };
@@ -441,8 +444,6 @@ where
                 if interrupt_flags.transfer() {
                     let transfer_result = {
                         let status = regs.int_st().read();
-                        error!("status = {:#x}", status.0);
-
                         if status.mask_uis_endp() != 0 {
                             // Unexpected
                             error!("Expected STATUS stage saw non ep0, aborting");
