@@ -2,7 +2,6 @@ use core::marker::PhantomData;
 use core::task::Poll;
 
 use ch32_metapac::otg::vals::{EpRxResponse, EpTxResponse, UsbToken};
-use defmt::{debug, error, trace};
 use embassy_usb_driver::{Direction, EndpointAllocError, EndpointError, EndpointInfo};
 use futures::future::poll_fn;
 
@@ -142,7 +141,7 @@ impl<'d, T: Instance, D: Dir> Endpoint<'d, T, D> {
             (7, Direction::In) => regs.uep7_mod().read().uep7_tx_en(),
             (7, Direction::Out) => regs.uep7_mod().read().uep7_rx_en(),
 
-            _ => unreachable!(),
+            _ => panic!("Unsupported EP"),
         }
     }
 }
@@ -199,9 +198,9 @@ impl<'d, T: Instance> embassy_usb_driver::EndpointOut for Endpoint<'d, T, Out> {
                         UsbToken::SETUP => Poll::Ready(Err(EndpointError::Disabled)),
                         UsbToken::OUT => {
                             // upper bits are reserved (0)
-                            // TODO fix metapac
                             let len = regs.rx_len().read().0 as usize;
-                            // TODO debug assert
+
+                            // Assertion exists because looks like embassy-usb expects no partial reads.
                             // https://github.com/embassy-rs/embassy/blob/6e0b08291b63a0da8eba9284869d1d046bc5dabb/embassy-usb/src/lib.rs#L408
                             debug_assert_eq!(len, buf.len());
                             if len == buf.len() {
@@ -228,8 +227,8 @@ impl<'d, T: Instance> embassy_usb_driver::EndpointOut for Endpoint<'d, T, Out> {
             ret
         })
         .await?;
+        trace!("{} out read success", self.info.addr);
 
-        trace!("{:x}", buf);
         Ok(bytes_read)
     }
 }
@@ -301,7 +300,6 @@ where
     }
 
     async fn data_out(&mut self, buf: &mut [u8], first: bool, last: bool) -> Result<usize, EndpointError> {
-        panic!();
         trace!("data_out");
         assert!(buf.len() <= EP_MAX_PACKET_SIZE as usize, "out buf too large");
         assert!(first && last, "TODO support chunking");

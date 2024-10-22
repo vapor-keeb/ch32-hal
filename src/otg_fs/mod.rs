@@ -1,12 +1,28 @@
-use core::cell::UnsafeCell;
+//! USB_FS and OTG_FS device mode peripheral driver
+//! Note that this currently only implements device mode
+//! 
+//! <div class="warning">
+//! There's a lot of TODOs and panics where things are not implemented
+//! </div>
+//! 
+//! List of things that is tested and to be tested
+//! Control Pipe:
+//! - [x] Recieve `SETUP` packet (Host -> Dev) 
+//! - [x] Send `IN` packet (Dev -> Host).
+//! - [ ] Recieve `OUT` packet (Host -> Dev).
+//! 
+//! Other Endpoints: 
+//! - [x] Interrupt Out
+//! - [ ] Interrupt In
+//! - [ ] Bulk Out
+//! - [ ] Bulk In
+//! 
+
 use core::future::poll_fn;
 use core::marker::PhantomData;
-use core::panic;
-use core::sync::atomic::AtomicBool;
 use core::task::Poll;
 
 use ch32_metapac::otg::vals::{EpRxResponse, EpTxResponse, UsbToken};
-use defmt::{debug, error, info, trace, warn};
 use embassy_sync::waitqueue::AtomicWaker;
 use embassy_usb_driver::{self as driver, Direction, EndpointAddress, EndpointInfo, EndpointType, Event};
 use endpoint::{ControlPipe, Endpoint, EndpointBufferAllocator, EndpointDataBuffer};
@@ -20,7 +36,7 @@ pub mod endpoint;
 pub mod marker;
 
 // TODO: We technically support 16, but we only allow 8 for now (0, 1-7).
-const MAX_NR_EP: usize = 7;
+const MAX_NR_EP: usize = 8;
 const EP_MAX_PACKET_SIZE: u16 = 64;
 
 const NEW_AW: AtomicWaker = AtomicWaker::new();
@@ -31,12 +47,6 @@ pub struct InterruptHandler<T: Instance> {
     _phantom: PhantomData<T>,
 }
 
-/* Interrupt Handlers
-
-   AFAICT, LP is triggered for **ALL** events, and HP is only triggered on
-   "double buffered" bulk transfers and iso transfers. I think we can safely
-   ignore that for now. WKUP is for well USB WakeUp events
-*/
 impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandler<T> {
     unsafe fn on_interrupt() {
         let regs = T::regs();
@@ -82,11 +92,6 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
             regs.int_fg().write(|v| v.set_hst_sof(true));
         }
     }
-}
-
-struct ControlPipeSetupState {
-    setup_data: UnsafeCell<[u8; 8]>,
-    setup_ready: AtomicBool,
 }
 
 pub struct Driver<'d, T: Instance, const NR_EP: usize> {
@@ -186,7 +191,6 @@ impl<'d, T: Instance, const NR_EP: usize> driver::Driver<'d> for Driver<'d, T, N
 
     fn start(mut self, control_max_packet_size: u16) -> (Self::Bus, Self::ControlPipe) {
         assert!(control_max_packet_size <= EP_MAX_PACKET_SIZE);
-        trace!("start");
         let regs = T::regs();
 
         regs.uep_rx_ctrl(0).write(|v| v.set_mask_r_res(EpRxResponse::NAK));
@@ -200,8 +204,6 @@ impl<'d, T: Instance, const NR_EP: usize> driver::Driver<'d> for Driver<'d, T, N
 
         // Clear all
         regs.ctrl().write(|_| {});
-
-        info!("value is {}", regs.uep_rx_ctrl(0).read().mask_r_res().to_bits());
 
         regs.int_en().write(|w| {
             // w.set_dev_nak(true);
@@ -287,11 +289,12 @@ where
     T: Instance,
 {
     async fn enable(&mut self) {
+        #[cfg(feature="defmt")]
         trace!("Enable")
     }
 
     async fn disable(&mut self) {
-        // TODO: ???
+        #[cfg(feature="defmt")]
         trace!("Disable")
     }
 
@@ -301,7 +304,6 @@ where
             self.inited = true;
             return Event::PowerDetected;
         }
-        trace!("bus poll");
 
         poll_fn(|ctx| {
             BUS_WAKER.register(ctx.waker());
@@ -340,19 +342,14 @@ where
     }
 
     fn endpoint_set_enabled(&mut self, ep_addr: EndpointAddress, enabled: bool) {
-        debug!(
+        #[cfg(feature="defmt")]
+        trace!(
             "[USBFS] Endpoint: {}, {}: Set enable={}",
             ep_addr.index(),
             ep_addr.direction(),
             enabled
         );
         let regs = T::regs();
-        // let reg_index = match ep_addr.index() {
-        //     0..=7 => ep_addr.index(),
-        //     8 => 4,
-        //     9..=15 => ep_addr.index() - 8,
-        //     _ => panic!(),
-        // };
 
         match (ep_addr.index(), ep_addr.direction()) {
             (4, Direction::In) => regs.uep4_1_mod().modify(|v| {
@@ -402,7 +399,9 @@ where
             }),
 
             _ => {
-                error!("setting non-existent endpoint {} to {}", ep_addr, enabled);
+                #[cfg(feature = "defmt")]
+                defmt::panic!("setting non-existent endpoint {} to {}", ep_addr, enabled);
+                #[cfg(not(feature = "defmt"))]
                 panic!()
             }
         }
@@ -429,7 +428,7 @@ trait SealedInstance: RccPeripheral {
     fn regs() -> crate::pac::otg::Usbd;
 }
 
-/// I2C peripheral instance
+/// OTG_FS peripheral instance
 #[allow(private_bounds)]
 pub trait Instance: SealedInstance + 'static {
     type Interrupt: interrupt::typelevel::Interrupt;
