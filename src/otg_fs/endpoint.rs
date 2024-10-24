@@ -310,8 +310,8 @@ where
 
         assert!(!regs.int_fg().read().transfer(), "transfer should not be pending");
 
-        regs.uep_rx_ctrl(0).write(|v| {
-            v.set_r_tog(true);
+        regs.uep_rx_ctrl(0).modify(|v| {
+            v.set_r_tog(!v.r_tog());
             v.set_mask_r_res(EpRxResponse::ACK);
         });
 
@@ -339,6 +339,7 @@ where
                                 Poll::Ready(Err(EndpointError::BufferOverflow))
                             } else {
                                 self.ep0_buf.buffer.read_volatile(&mut buf[..len]);
+                                trace!("{:x}", buf);
                                 Poll::Ready(Ok(len))
                             }
                         }
@@ -357,14 +358,13 @@ where
         })
         .await?;
 
-        regs.uep_rx_ctrl(0).write(|v| {
-            v.set_r_tog(true);
+        regs.uep_rx_ctrl(0).modify(|v| {
             v.set_mask_r_res(EpRxResponse::NAK);
         });
 
         regs.uep_t_len(0).write_value(0);
-        regs.uep_tx_ctrl(0).write(|v| {
-            v.set_t_tog(true);
+        regs.uep_tx_ctrl(0).modify(|v| {
+            v.set_t_tog(!v.t_tog());
             v.set_mask_t_res(EpTxResponse::ACK);
         });
 
@@ -380,17 +380,11 @@ where
                             error!("Expected STATUS stage saw non ep0, aborting");
                             Poll::Ready(Err(EndpointError::Disabled))
                         } else if status.mask_token() == UsbToken::IN {
-                            if regs.rx_len().read().0 != 0 {
-                                error!("Expected 0 len OUT stage, found non-zero len, aborting");
-                                Poll::Ready(Err(EndpointError::Disabled))
-                            } else {
-                                // Set the EP back to NAK so that we are "not ready to recieve"
-                                regs.uep_tx_ctrl(0).write(|v| {
-                                    v.set_t_tog(true);
-                                    v.set_mask_t_res(EpTxResponse::NAK);
-                                });
-                                Poll::Ready(Ok(()))
-                            }
+                            // Set the EP back to NAK so that we are "not ready to recieve"
+                            regs.uep_tx_ctrl(0).modify(|v| {
+                                v.set_mask_t_res(EpTxResponse::NAK);
+                            });
+                            Poll::Ready(Ok(()))
                         } else {
                             Poll::Ready(Err(EndpointError::Disabled))
                         }
