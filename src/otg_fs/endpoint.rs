@@ -322,10 +322,7 @@ where
             let ret = if regs.int_fg().read().transfer() {
                 let status = regs.int_st().read();
                 if status.mask_uis_endp() == 0 {
-                    let token = status.mask_token();
-                    trace!("[IRQ USBFS] Transfer Token: {:#x}", token.to_bits());
-
-                    let ret = match token {
+                    let ret = match status.mask_token() {
                         UsbToken::RSVD | UsbToken::IN => unreachable!(),
                         UsbToken::SETUP => Poll::Ready(Err(EndpointError::Disabled)),
                         UsbToken::OUT => {
@@ -339,7 +336,6 @@ where
                                 Poll::Ready(Err(EndpointError::BufferOverflow))
                             } else {
                                 self.ep0_buf.buffer.read_volatile(&mut buf[..len]);
-                                trace!("{:x}", buf);
                                 Poll::Ready(Ok(len))
                             }
                         }
@@ -361,44 +357,6 @@ where
         regs.uep_rx_ctrl(0).modify(|v| {
             v.set_mask_r_res(EpRxResponse::NAK);
         });
-
-        regs.uep_t_len(0).write_value(0);
-        regs.uep_tx_ctrl(0).modify(|v| {
-            v.set_t_tog(!v.t_tog());
-            v.set_mask_t_res(EpTxResponse::ACK);
-        });
-
-        poll_fn(|ctx| {
-            super::EP_WAKERS[0].register(ctx.waker());
-            let poll_res = {
-                if regs.int_fg().read().transfer() {
-                    let status = regs.int_st().read();
-                    assert_eq!(status.mask_uis_endp(), 0, "Not EP0");
-                    let transfer_res = {
-                        if status.mask_uis_endp() != 0 {
-                            // Unexpected
-                            error!("Expected STATUS stage saw non ep0, aborting");
-                            Poll::Ready(Err(EndpointError::Disabled))
-                        } else if status.mask_token() == UsbToken::IN {
-                            // Set the EP back to NAK so that we are "not ready to recieve"
-                            regs.uep_tx_ctrl(0).modify(|v| {
-                                v.set_mask_t_res(EpTxResponse::NAK);
-                            });
-                            Poll::Ready(Ok(()))
-                        } else {
-                            Poll::Ready(Err(EndpointError::Disabled))
-                        }
-                    };
-                    regs.int_fg().write(|v| v.set_transfer(true));
-                    transfer_res
-                } else {
-                    Poll::Pending
-                }
-            };
-            unsafe { T::Interrupt::enable() };
-            poll_res
-        })
-        .await?;
 
         Ok(bytes_read)
     }
@@ -545,7 +503,7 @@ where
                         });
                         regs.int_fg().write(|v| v.set_transfer(true));
                     }
-                    UsbToken::OUT | UsbToken::RSVD | UsbToken::SETUP => panic!(),
+                    token => panic!("Token = {}", token as u8),
                 }
                 Poll::Ready(())
             } else {
