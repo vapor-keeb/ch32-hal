@@ -5,9 +5,11 @@ use core::panic;
 use core::sync::atomic::{fence, AtomicBool, Ordering};
 use core::task::Poll;
 
+use ch32_metapac::exti::regs::Intfr;
 use ch32_metapac::otg::vals::{EpRxResponse, EpTxResponse, UsbToken};
 use defmt::{debug, error, info, trace, warn};
 use embassy_sync::waitqueue::AtomicWaker;
+use embassy_time::{Duration, Timer};
 use embassy_usb_driver::{
     self as driver, Direction, EndpointAddress, EndpointError, EndpointIn, EndpointInfo, EndpointType, Event,
 };
@@ -259,8 +261,9 @@ impl<'d, T: Instance> driver::Driver<'d> for Driver<'d, T> {
             w.set_dev_pu_en(true);
         });
 
-        regs.uep_dma(0)
-            .write_value(self.ep_out_buffer[0].data.as_mut_ptr() as u32);
+        let epdma_addr = self.ep_out_buffer[0].data.as_mut_ptr() as u32;
+        trace!("epdma is about to become: {:#x}", epdma_addr);
+        regs.uep_dma(0).write_value(epdma_addr);
 
         regs.uep_rx_ctrl(0).write(|w| w.set_mask_r_res(EpRxResponse::ACK));
         regs.uep_tx_ctrl(0).write(|w| w.set_mask_t_res(EpTxResponse::NAK));
@@ -471,11 +474,9 @@ where
                         UsbToken::SETUP => {
                             // SETUP packet token
                             regs.uep_tx_ctrl(0).write(|w| {
-                                w.set_t_tog(true);
                                 w.set_mask_t_res(EpTxResponse::NAK);
                             });
                             regs.uep_rx_ctrl(0).write(|w| {
-                                w.set_r_tog(true);
                                 w.set_mask_r_res(EpRxResponse::NAK);
                             });
                             let mut data = [0u8; 8];
@@ -638,15 +639,6 @@ where
             return Err(EndpointError::BufferOverflow);
         }
 
-        assert!(first && last, "TODO, handle other cases");
-
-        // AFAIK this is already true
-        // regs.uep_rx_ctrl(0).write(|v| {
-        //     // Mark the RX endpoint as "NAK", because we can't really do
-        //     // anything, the EP buffer will be occupied by the out going data.
-        //     v.set_mask_r_res(EpRxResponse::NAK);
-        // });
-
         // Deposit data in dma buffer
         self.buffer.write_volatile(data);
 
@@ -656,22 +648,29 @@ where
         // TODO: manual is wrong here, t_len(3) should be a u16
         regs.uep_t_len(0).write_value(data.len() as u8);
 
-        regs.uep_tx_ctrl(0).write(|v| {
+        regs.uep_tx_ctrl(0).modify(|v| {
             v.set_mask_t_res(EpTxResponse::ACK);
-            // ? not sure why but following their example
-            v.set_t_tog(true);
+
+            // First control in should always be DATA1?
+            // TODO: Toggle after first
+            if first {
+                v.set_t_tog(true);
+            } else {
+                v.set_t_tog(!v.t_tog());
+            }
         });
 
         // TODO: this is potentially wrong, we should wait for finish even for not last packet
         // Last packet we need to wait for it to finish
-        if last {
-            // Poll for last packet to finsh transfer
-            poll_fn(|ctx| {
-                EP0_WAKER.register(ctx.waker());
-                let poll_result = {
-                    let int_flags = regs.int_fg().read();
-                    if int_flags.transfer() {
+        // Poll for last packet to finsh transfer
+        poll_fn(|ctx| {
+            EP0_WAKER.register(ctx.waker());
+            let poll_result = {
+                let interrupt_flags = regs.int_fg().read();
+                if interrupt_flags.transfer() {
+                    let transfer_result = {
                         let status = regs.int_st().read();
+                        error!("status = {:#x}", status.0);
 
                         if status.mask_uis_endp() != 0 {
                             // Unexpected
@@ -681,37 +680,37 @@ where
                             match status.mask_token() {
                                 UsbToken::OUT | UsbToken::RSVD => unreachable!(),
                                 UsbToken::IN => {
-                                    fence(Ordering::SeqCst);
-                                    trace!("huh: {:X}", self.buffer.data[..data.len()]);
-                                    regs.uep_tx_ctrl(0).write(|v| {
-                                        v.set_t_tog(true);
+                                    regs.uep_tx_ctrl(0).modify(|v| {
                                         v.set_mask_t_res(EpTxResponse::NAK);
                                     });
-                                    regs.uep_rx_ctrl(0).write(|v| {
-                                        // Set RX to true to expect the STATUS (OUT) packet
-                                        v.set_mask_r_res(EpRxResponse::ACK);
-                                        v.set_r_tog(true);
-                                    });
-                                    regs.int_fg().write(|v| v.set_transfer(true));
+                                    if last {
+                                        regs.uep_rx_ctrl(0).modify(|v| {
+                                            // Set RX to true to expect the STATUS (OUT) packet
+                                            v.set_mask_r_res(EpRxResponse::ACK);
+                                        });
+                                    }
                                     Poll::Ready(Ok(()))
                                 }
                                 UsbToken::SETUP => {
                                     error!("SETUP while data_in, aborting");
-                                    // TODO: unsure
-                                    // regs.int_fg().write(|v| v.set_transfer(true));
                                     Poll::Ready(Err(EndpointError::Disabled))
                                 }
                             }
                         }
-                    } else {
-                        Poll::Pending
-                    }
-                };
-                unsafe { T::Interrupt::enable() };
-                poll_result
-            })
-            .await?;
+                    };
 
+                    regs.int_fg().write(|v| v.set_transfer(true));
+                    transfer_result
+                } else {
+                    Poll::Pending
+                }
+            };
+            unsafe { T::Interrupt::enable() };
+            poll_result
+        })
+        .await?;
+
+        if last {
             // Expect the empty OUT token for status
             poll_fn(|ctx| {
                 EP0_WAKER.register(ctx.waker());
