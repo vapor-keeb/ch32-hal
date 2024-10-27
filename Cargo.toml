@@ -17,7 +17,6 @@ ch32-metapac = { features = [
     "memory-x",
     "rt",
 ], git = "https://github.com/vapor-keeb/ch32-metapac.git", branch = "main" }
-# ch32-metapac = { features = ["memory-x","rt"], path = "../ch32-data/build/ch32-metapac" }
 
 qingke = { version = "0.4.0", features = ["critical-section-impl"] }
 qingke-rt = { version = "0.4.0", optional = true }
