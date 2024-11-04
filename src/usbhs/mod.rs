@@ -439,5 +439,7 @@ foreach_peripheral!(
     };
 );
 
+pub mod host;
+
 pin_trait!(DmPin, Instance);
 pin_trait!(DpPin, Instance);
