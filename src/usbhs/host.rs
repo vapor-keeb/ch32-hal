@@ -9,7 +9,7 @@ use crate::{
     interrupt,
 };
 
-use super::{DmPin, DpPin};
+use super::Instance;
 
 const MAX_PACKET_SIZE: usize = 64;
 static EP_TX_BUF: [u8; MAX_PACKET_SIZE] = [0; MAX_PACKET_SIZE];
@@ -38,8 +38,8 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
 }
 
 pub fn start<'d, T: Instance>(
-    dp: impl Peripheral<P = impl DpPin<T, 0> + 'd>,
-    dm: impl Peripheral<P = impl DmPin<T, 0> + 'd>,
+    dp: impl Peripheral<P = impl super::DpPin<T, 0> + 'd>,
+    dm: impl Peripheral<P = impl super::DmPin<T, 0> + 'd>,
 ) {
     let dp = dp.into_ref();
     let dm = dm.into_ref();
@@ -107,47 +107,3 @@ pub fn start<'d, T: Instance>(
         }
     }
 }
-
-/// USB endpoint.
-trait SealedInstance: crate::peripheral::RccPeripheral {
-    fn regs() -> crate::pac::usbhs::Usb;
-    fn dregs() -> crate::pac::usbhs::Usbd;
-    fn hregs() -> crate::pac::usbhs::Usbh;
-}
-
-/// UsbHs peripheral instance
-#[allow(private_bounds)]
-pub trait Instance: SealedInstance + 'static {
-    /// Regular interrupt for this instance
-    type Interrupt: interrupt::typelevel::Interrupt;
-    /// Wakeup interrupt for this instance
-    type WakeupInterrupt: interrupt::typelevel::Interrupt;
-}
-
-foreach_peripheral!(
-    (usbhs, $inst:ident) => {
-        use crate::peripherals;
-        impl SealedInstance for peripherals::$inst {
-            fn regs() -> crate::pac::usbhs::Usb {
-                crate::pac::$inst
-            }
-
-            fn dregs() -> crate::pac::usbhs::Usbd {
-                unsafe {
-                    crate::pac::usbhs::Usbd::from_ptr(crate::pac::$inst.as_ptr())
-                }
-            }
-
-            fn hregs() -> crate::pac::usbhs::Usbh {
-                unsafe {
-                    crate::pac::usbhs::Usbh::from_ptr(crate::pac::$inst.as_ptr())
-                }
-            }
-        }
-
-        impl Instance for peripherals::$inst {
-            type Interrupt = crate::_generated::peripheral_interrupts::$inst::GLOBAL;
-            type WakeupInterrupt = crate::_generated::peripheral_interrupts::$inst::WAKEUP;
-        }
-    };
-);
