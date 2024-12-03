@@ -1,8 +1,10 @@
-use core::marker::PhantomData;
+use core::{future::{poll_fn, PollFn}, marker::PhantomData, task::{Poll, Waker}};
 
 use crate::interrupt::typelevel::Interrupt;
 use ch32_metapac::usbhs::vals::SpeedType;
+use defmt::Format;
 use embassy_hal_internal::Peripheral;
+use embassy_sync::waitqueue::AtomicWaker;
 
 use crate::{
     gpio::{AFType, Speed},
@@ -15,24 +17,63 @@ const MAX_PACKET_SIZE: usize = 64;
 static EP_TX_BUF: [u8; MAX_PACKET_SIZE] = [0; MAX_PACKET_SIZE];
 static EP_RX_BUF: [u8; MAX_PACKET_SIZE] = [0; MAX_PACKET_SIZE];
 
+static BUS_WAKER: AtomicWaker = AtomicWaker::new();
+
 pub struct InterruptHandler<T: Instance> {
     _phantom: PhantomData<T>,
+}
+
+pub struct USBHsHostDriver<T: Instance> {
+    _phantom: PhantomData<T>,
+}
+
+pub struct Bus<T: Instance> {
+    _phantom: PhantomData<T>,
+}
+
+#[cfg_attr(feature="defmt", derive(Format))]
+pub enum Event {
+    DeviceAttach,
+    DeviceDetach,
+}
+
+impl<T: Instance> Bus<T> {
+    pub async fn poll(&mut self) -> Event {
+        poll_fn(|ctx| {
+            BUS_WAKER.register(ctx.waker());
+
+            let regs = T::hregs();
+
+            let flags = regs.int_fg().read();
+            if flags.detect() {
+                let res = if regs.mis_st().read().dev_attach() {
+                    Event::DeviceAttach
+                } else {
+                    Event::DeviceDetach
+                };
+
+                regs.int_fg().write(|v| v.set_detect(true));
+                critical_section::with(|_| regs.int_en().modify(|v| v.set_detect(true)));
+
+                Poll::Ready(res)
+            } else {
+                Poll::Pending
+            }
+
+            // TODO more flags
+        }).await
+    }
 }
 
 impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandler<T> {
     unsafe fn on_interrupt() {
         let r = T::regs();
-        let h = T::hregs();
         let flag = r.int_fg().read();
 
+        trace!("irq: {:x}", flag.0);
         if flag.detect() {
-            let misc_status = r.mis_st().read();
-            if misc_status.dev_attach() {
-                trace!("dev attach");
-            } else {
-                trace!("dev disconnect");
-            }
-            r.int_fg().write(|w| w.set_detect(true));
+            r.int_en().modify(|v| v.set_detect(false));
+            BUS_WAKER.wake();
         }
     }
 }
@@ -40,7 +81,7 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
 pub fn start<'d, T: Instance>(
     dp: impl Peripheral<P = impl super::DpPin<T, 0> + 'd>,
     dm: impl Peripheral<P = impl super::DmPin<T, 0> + 'd>,
-) {
+) -> (Bus<T>, USBHsHostDriver<T>) {
     let dp = dp.into_ref();
     let dm = dm.into_ref();
 
@@ -84,26 +125,12 @@ pub fn start<'d, T: Instance>(
         w.set_dev_nak(false);
         w.set_fifo_ov(true);
         w.set_setup_act(true);
-        w.set_suspend(true);
+        w.set_suspend(false);
         w.set_transfer(true);
         w.set_detect(true);
     });
 
     unsafe { T::Interrupt::enable() };
 
-    loop {
-        let r = T::regs();
-        let h = T::hregs();
-        let flag = r.int_fg().read();
-
-        if flag.detect() {
-            let misc_status = r.mis_st().read();
-            if misc_status.dev_attach() {
-                trace!("dev attach");
-            } else {
-                trace!("dev disconnect");
-            }
-            r.int_fg().write(|w| w.set_detect(true));
-        }
-    }
+    (Bus { _phantom: PhantomData }, USBHsHostDriver { _phantom: PhantomData })
 }
