@@ -1,4 +1,8 @@
-use core::{future::{poll_fn, PollFn}, marker::PhantomData, task::{Poll, Waker}};
+use core::{
+    future::{poll_fn, PollFn},
+    marker::PhantomData,
+    task::{Poll, Waker},
+};
 
 use crate::interrupt::typelevel::Interrupt;
 use ch32_metapac::usbhs::vals::SpeedType;
@@ -31,10 +35,12 @@ pub struct Bus<T: Instance> {
     _phantom: PhantomData<T>,
 }
 
-#[cfg_attr(feature="defmt", derive(Format))]
+#[cfg_attr(feature = "defmt", derive(Format))]
 pub enum Event {
     DeviceAttach,
     DeviceDetach,
+    Suspend,
+    Resume,
 }
 
 impl<T: Instance> Bus<T> {
@@ -56,12 +62,24 @@ impl<T: Instance> Bus<T> {
                 critical_section::with(|_| regs.int_en().modify(|v| v.set_detect(true)));
 
                 Poll::Ready(res)
+            } else if flags.suspend() {
+                let res = if regs.mis_st().read().suspend() {
+                    Event::Suspend
+                } else {
+                    Event::Resume
+                };
+
+                regs.int_fg().write(|v| v.set_suspend(true));
+                critical_section::with(|_| regs.int_en().modify(|v| v.set_suspend(true)));
+
+                Poll::Ready(res)
             } else {
                 Poll::Pending
             }
 
             // TODO more flags
-        }).await
+        })
+        .await
     }
 }
 
@@ -70,11 +88,16 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
         let r = T::regs();
         let flag = r.int_fg().read();
 
-        trace!("irq: {:x}", flag.0);
         if flag.detect() {
             r.int_en().modify(|v| v.set_detect(false));
             BUS_WAKER.wake();
+        } 
+        if flag.suspend() {
+            r.int_en().modify(|v| v.set_suspend(false));
+            BUS_WAKER.wake();
         }
+
+        trace!("irq: {:x}", flag.0);
     }
 }
 
@@ -101,7 +124,7 @@ pub fn start<'d, T: Instance>(
     // Sleep for 10uS from WCH C code
     embassy_time::block_for(embassy_time::Duration::from_micros(10));
 
-    r.ctrl().write(|w| {});
+    r.ctrl().write(|_| {});
 
     r.ctrl().write(|w| {
         w.set_host_mode(true);
@@ -125,7 +148,7 @@ pub fn start<'d, T: Instance>(
         w.set_dev_nak(false);
         w.set_fifo_ov(true);
         w.set_setup_act(true);
-        w.set_suspend(false);
+        w.set_suspend(true);
         w.set_transfer(true);
         w.set_detect(true);
     });
