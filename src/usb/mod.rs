@@ -62,6 +62,12 @@ impl Default for EndpointDataBuffer {
 }
 
 impl EndpointDataBuffer {
+    pub const fn new() -> Self {
+        Self {
+            data: [0; ENDPOINT_DATA_BUFFER_SIZE],
+        }
+    }
+
     pub(crate) fn read_volatile(&self, buf: &mut [u8]) {
         assert!(buf.len() <= self.data.len());
         let len = buf.len();
