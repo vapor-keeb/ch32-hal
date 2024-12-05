@@ -75,9 +75,11 @@ impl<'d, T: Instance> embassy_usb_driver::ControlPipe for ControlPipe<'d, T> {
                 v.set_mask_uep_r_res(EpRxResponse::ACK);
             })
         } else {
-            d.ep_rx_ctrl(0).modify(|v| {
-                v.set_mask_uep_r_res(EpRxResponse::ACK);
-            })
+            critical_section::with(|_| {
+                d.ep_rx_ctrl(0).modify(|v| {
+                    v.set_mask_uep_r_res(EpRxResponse::ACK);
+                })
+            });
         }
 
         self.ep0.data_out(buf).await
@@ -95,8 +97,10 @@ impl<'d, T: Instance> embassy_usb_driver::ControlPipe for ControlPipe<'d, T> {
                 v.set_mask_uep_t_tog(EpTog::DATA1);
             })
         } else {
-            d.ep_tx_ctrl(0).modify(|v| {
-                v.set_mask_uep_t_res(EpTxResponse::ACK);
+            critical_section::with(|_| {
+                d.ep_tx_ctrl(0).modify(|v| {
+                    v.set_mask_uep_t_res(EpTxResponse::ACK);
+                });
             });
         }
 
@@ -150,7 +154,7 @@ impl<'d, T: Instance> embassy_usb_driver::ControlPipe for ControlPipe<'d, T> {
         let d = T::dregs();
 
         d.ep_t_len(0).write(|w| w.set_len(0));
-        d.ep_tx_ctrl(0).modify(|w| {
+        d.ep_tx_ctrl(0).write(|w| {
             // status stage starts with DATA1
             w.set_mask_uep_t_tog(EpTog::DATA1);
             w.set_mask_uep_t_res(EpTxResponse::ACK);
@@ -162,10 +166,10 @@ impl<'d, T: Instance> embassy_usb_driver::ControlPipe for ControlPipe<'d, T> {
     async fn reject(&mut self) {
         let d = T::dregs();
 
-        d.ep_tx_ctrl(0).modify(|v| {
+        d.ep_tx_ctrl(0).write(|v| {
             v.set_mask_uep_t_res(EpTxResponse::STALL);
         });
-        d.ep_rx_ctrl(0).modify(|v| {
+        d.ep_rx_ctrl(0).write(|v| {
             v.set_mask_uep_r_res(EpRxResponse::STALL);
         });
     }

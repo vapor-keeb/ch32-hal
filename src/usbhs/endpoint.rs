@@ -81,12 +81,14 @@ impl<'d, T: Instance, D: Dir> Endpoint<'d, T, D> {
                     }
                 };
 
-                d.ep_rx_ctrl(index).modify(|v| {
-                    v.set_mask_uep_r_res(EpRxResponse::NAK);
-                    v.set_mask_uep_r_tog(if let EpTog::DATA0 = v.mask_uep_r_tog() {
-                        EpTog::DATA1
-                    } else {
-                        EpTog::DATA0
+                critical_section::with(|_| {
+                    d.ep_rx_ctrl(index).modify(|v| {
+                        v.set_mask_uep_r_res(EpRxResponse::NAK);
+                        v.set_mask_uep_r_tog(if let EpTog::DATA0 = v.mask_uep_r_tog() {
+                            EpTog::DATA1
+                        } else {
+                            EpTog::DATA0
+                        });
                     });
                 });
 
@@ -132,12 +134,14 @@ impl<'d, T: Instance, D: Dir> Endpoint<'d, T, D> {
                         Poll::Ready(Err(EndpointError::Disabled))
                     }
                 };
-                d.ep_tx_ctrl(index).modify(|v| {
-                    v.set_mask_uep_t_res(EpTxResponse::NAK);
-                    v.set_mask_uep_t_tog(if let EpTog::DATA0 = v.mask_uep_t_tog() {
-                        EpTog::DATA1
-                    } else {
-                        EpTog::DATA0
+                critical_section::with(|_| {
+                    d.ep_tx_ctrl(index).modify(|v| {
+                        v.set_mask_uep_t_res(EpTxResponse::NAK);
+                        v.set_mask_uep_t_tog(if let EpTog::DATA0 = v.mask_uep_t_tog() {
+                            EpTog::DATA1
+                        } else {
+                            EpTog::DATA0
+                        });
                     });
                 });
 
@@ -176,8 +180,10 @@ impl<'d, T: Instance> EndpointOut for Endpoint<'d, T, Out> {
             return Err(EndpointError::BufferOverflow);
         }
 
-        d.ep_rx_ctrl(index).modify(|v| {
-            v.set_mask_uep_r_res(EpRxResponse::ACK);
+        critical_section::with(|_| {
+            d.ep_rx_ctrl(index).modify(|v| {
+                v.set_mask_uep_r_res(EpRxResponse::ACK);
+            });
         });
 
         self.data_out(buf).await
@@ -196,8 +202,10 @@ impl<'d, T: Instance> EndpointIn for Endpoint<'d, T, In> {
 
         self.data_in_write_buffer(buf)?;
 
-        d.ep_tx_ctrl(index).modify(|v| {
-            v.set_mask_uep_t_res(EpTxResponse::ACK);
+        critical_section::with(|_| {
+            d.ep_tx_ctrl(index).modify(|v| {
+                v.set_mask_uep_t_res(EpTxResponse::ACK);
+            });
         });
 
         self.data_in_transfer().await
