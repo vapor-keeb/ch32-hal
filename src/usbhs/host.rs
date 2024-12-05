@@ -5,7 +5,7 @@ use core::{
 };
 
 use crate::{interrupt::typelevel::Interrupt, usb::EndpointDataBuffer};
-use ch32_metapac::usbhs::vals::SpeedType;
+use ch32_metapac::usbhs::vals::{HostRxResponse, HostTxResponse, SpeedType, Tog};
 use defmt::Format;
 use embassy_hal_internal::Peripheral;
 use embassy_sync::waitqueue::AtomicWaker;
@@ -25,6 +25,61 @@ static BUS_WAKER: AtomicWaker = AtomicWaker::new();
 static TX_WAKER: AtomicWaker = AtomicWaker::new();
 // static RX_WAKER: AtomicWaker = AtomicWaker::new();
 
+#[repr(u8)]
+#[cfg_attr(feature = "defmt", derive(Format))]
+#[cfg_attr(not(feature = "defmt"), derive(Debug))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PID {
+    OUT = 0b0001,
+    IN = 0b1001,
+    SOF = 0b0101,
+    SETUP = 0b1101,
+
+    DATA0 = 0b0011,
+    DATA1 = 0b1011,
+    DATA2 = 0b0111,
+    MDATA = 0b1111,
+
+    ACK = 0b0010,
+    NAK = 0b1010,
+    STALL = 0b1110,
+    NYET = 0b0110,
+
+    // PRE and ERR are both 0b1100???
+    SPLIT = 0b1000,
+    PING = 0b0100,
+    Rsvd = 0b0000,
+}
+
+impl TryFrom<u8> for PID {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0b0001 => Ok(PID::OUT),
+            0b1001 => Ok(PID::IN),
+            0b0101 => Ok(PID::SOF),
+            0b1101 => Ok(PID::SETUP),
+
+            0b0011 => Ok(PID::DATA0),
+            0b1011 => Ok(PID::DATA1),
+            0b0111 => Ok(PID::DATA2),
+            0b1111 => Ok(PID::MDATA),
+
+            0b0010 => Ok(PID::ACK),
+            0b1010 => Ok(PID::NAK),
+            0b1110 => Ok(PID::STALL),
+            0b0110 => Ok(PID::NYET),
+
+            0b1000 => Ok(PID::SPLIT),
+            0b0100 => Ok(PID::PING),
+            0b0000 => Ok(PID::Rsvd),
+
+            _ => Err(()),
+        }
+    }
+}
+
 pub struct InterruptHandler<T: Instance> {
     _phantom: PhantomData<T>,
 }
@@ -35,19 +90,35 @@ pub struct USBHsHostDriver<'d, T: Instance> {
     rx_buf: &'d mut EndpointDataBuffer,
 }
 
+#[cfg_attr(feature = "defmt", derive(Format))]
+#[cfg_attr(not(feature = "defmt"), derive(Debug))]
+pub enum UsbHostError {
+    NAK,
+    WrongTog,
+    STALL,
+    Unknown,
+    BufferOverflow,
+}
+
 impl<'d, T: Instance> USBHsHostDriver<'d, T> {
-    pub async fn setup(&mut self, buf: &[u8]) -> Result<(), EndpointError> {
+    /// Send the 8 byte setup
+    pub async fn setup(&mut self, buf: &[u8]) -> Result<(), UsbHostError> {
         let h = T::hregs();
 
         self.tx_buf.write_volatile(buf);
         h.ep_pid().write(|v| {
             v.set_endp(0);
-            v.set_token(0b1101);
+            v.set_token(PID::SETUP as u8);
         });
 
         h.tx_len().write(|v| v.set_len(buf.len() as u16));
-        h.rx_ctrl().write(|_| {});
-        h.tx_ctrl().write(|_| {});
+        h.rx_ctrl().write(|v| {
+            v.set_r_tog(Tog::DATA0);
+        });
+        h.tx_ctrl().write(|v| {
+            v.set_t_tog(Tog::DATA0);
+            v.set_t_res(HostTxResponse::ACK);
+        });
 
         assert!(!h.int_fg().read().transfer());
 
@@ -57,17 +128,90 @@ impl<'d, T: Instance> USBHsHostDriver<'d, T> {
             let status = h.int_st().read();
 
             if transfer {
-                trace!("status h_res {}", status.0);
+                // First stop sending more setup
                 h.ep_pid().write(|_| {});
+
+                // Check what the device responded
+                let device_response = unwrap!(TryInto::<PID>::try_into(status.h_res()));
+                let res = match device_response {
+                    PID::ACK => Ok(()),
+                    PID::NAK => Err(UsbHostError::NAK),
+                    PID::STALL => Err(UsbHostError::STALL),
+                    _ => panic!("??? {:?}", device_response),
+                };
+
+                // Mark transfer as complete
                 h.int_fg().write(|w| w.set_transfer(true));
                 critical_section::with(|_| h.int_en().modify(|w| w.set_transfer(true)));
-                Poll::Ready(())
+                Poll::Ready(res)
             } else {
                 Poll::Pending
             }
         })
-        .await;
-        Ok(())
+        .await
+    }
+
+    pub async fn data_in(&mut self, buf: &mut [u8]) -> Result<usize, UsbHostError> {
+        let h = T::hregs();
+        // Send IN token to allow the bytes to come in
+        critical_section::with(|_| {
+            h.rx_ctrl().modify(|v| {
+                v.set_r_tog(match v.r_tog() {
+                    Tog::DATA0 => Tog::DATA1,
+                    Tog::DATA1 => Tog::DATA0,
+                    _ => panic!()
+                });
+            });
+        });
+        h.ep_pid().write(|v| {
+            v.set_endp(0);
+            v.set_token(PID::IN as u8);
+        });
+
+        poll_fn(|ctx| {
+            TX_WAKER.register(ctx.waker());
+            let transfer = h.int_fg().read().transfer();
+            let status = h.int_st().read();
+            if transfer {
+                // First stop sending more setup
+                h.ep_pid().write(|_| {});
+                trace!("status: {}", status.0);
+                let res = match unwrap!(TryInto::<PID>::try_into(status.h_res())) {
+                    PID::DATA0 |
+                    PID::DATA1 => {
+                        if status.tog_ok() {
+                            let bytes_read = h.rx_len().read() as usize;
+                            debug_assert!(bytes_read <= 64); // TODO: FIX THIS when we have a size for self.rx_buf
+                            if bytes_read > buf.len() {
+                                Err(UsbHostError::BufferOverflow)
+                            } else {
+                                self.rx_buf.read_volatile(&mut buf[..bytes_read]);
+                                Ok(bytes_read)
+                            }
+                        } else {
+                            error!("Wrong TOG");
+                            Err(UsbHostError::WrongTog)
+                        }
+                    },
+                    PID::NAK => panic!("NAK"),
+                    PID::STALL => {
+                        Err(UsbHostError::STALL)
+                    },
+                    pid => {
+                        panic!("Unexpected pid: {}", pid)
+                    }
+                };
+
+                // Mark transfer as complete
+                h.int_fg().write(|w| w.set_transfer(true));
+                critical_section::with(|_| h.int_en().modify(|w| w.set_transfer(true)));
+
+                Poll::Ready(res)
+            } else {
+                Poll::Pending
+            }
+        })
+        .await
     }
 }
 
