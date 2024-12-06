@@ -50,6 +50,7 @@ use crate::{interrupt, Peripheral};
 
 pub mod control;
 mod endpoint;
+pub mod host;
 
 const MAX_NR_EP: usize = 16;
 const EP_MAX_PACKET_SIZE: u16 = 64;
@@ -438,8 +439,6 @@ foreach_peripheral!(
         }
     };
 );
-
-pub mod host;
 
 pin_trait!(DmPin, Instance);
 pin_trait!(DpPin, Instance);
