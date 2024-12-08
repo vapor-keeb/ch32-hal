@@ -49,6 +49,10 @@ impl<'d, T: Instance> async_usb_host::Bus for Bus<'d, T> {
                 panic!("attach after reset");
             }
         }
+        // don't let the bus sleep (NOT GOOD)
+        critical_section::with(|_| {
+            T::hregs().ctrl().modify(|w| w.set_sof_en(true));
+        });
     }
 
     async fn poll(&mut self) -> Event {
@@ -201,7 +205,7 @@ impl<'d, T: Instance> async_usb_host::Bus for Bus<'d, T> {
 
     async fn data_out(&mut self, buf: &[u8]) -> Result<(), UsbHostError> {
         if buf.len() > MAX_PACKET_SIZE {
-            return Err(UsbHostError::BufferOverflow)
+            return Err(UsbHostError::BufferOverflow);
         }
 
         let h = T::hregs();
@@ -209,8 +213,8 @@ impl<'d, T: Instance> async_usb_host::Bus for Bus<'d, T> {
         self.tx_buf.write_volatile(buf);
         h.tx_len().write(|v| v.set_len(buf.len() as u16));
         critical_section::with(|_| {
-            h.rx_ctrl().modify(|v| {
-                v.set_r_tog(match v.r_tog() {
+            h.tx_ctrl().modify(|v| {
+                v.set_t_tog(match v.t_tog() {
                     Tog::DATA0 => Tog::DATA1,
                     Tog::DATA1 => Tog::DATA0,
                     _ => panic!(),

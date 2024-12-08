@@ -113,7 +113,7 @@ impl<'d, T: Instance> async_usb_host::Driver for USBHsHostDriver<'d, T> {
         h.rx_dma().write_value(rx_buf.addr() as u32);
         h.tx_dma().write_value(tx_buf.addr() as u32);
 
-        h.ctrl().write(|w| w.set_phy_suspendm(true));
+        h.ctrl().write(|w|  w.set_phy_suspendm(true));
 
         h.rx_max_len().write(|w| w.set_len(MAX_PACKET_SIZE as u16));
 
