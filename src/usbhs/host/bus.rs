@@ -95,8 +95,15 @@ impl<'d, T: Instance> async_usb_host::Bus for Bus<'d, T> {
         })
         .await
     }
+
+    fn set_addr(&mut self, addr: u8) {
+        let h = T::hregs();
+        h.dev_ad().write(|v| v.set_addr(addr));
+    }
+
     /// Send the 8 byte setup
     async fn setup(&mut self, buf: &[u8; 8]) -> Result<(), UsbHostError> {
+        trace!("setup: {:x}", buf);
         let h = T::hregs();
 
         self.tx_buf.write_volatile(buf);
@@ -129,7 +136,7 @@ impl<'d, T: Instance> async_usb_host::Bus for Bus<'d, T> {
                     Pid::ACK => Ok(()),
                     Pid::NAK => Err(UsbHostError::NAK),
                     Pid::STALL => Err(UsbHostError::STALL),
-                    _ => panic!("??? {:?}", device_response),
+                    r => panic!("??? {:?} {:x}", r, status.h_res()),
                 };
 
                 // Mark transfer as complete
