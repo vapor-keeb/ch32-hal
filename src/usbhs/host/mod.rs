@@ -4,6 +4,7 @@ use bus::Bus;
 use ch32_metapac::usbhs::vals::SpeedType;
 use embassy_hal_internal::Peripheral;
 use embassy_sync::waitqueue::AtomicWaker;
+use pipe::Pipe;
 
 use crate::interrupt::typelevel::Interrupt;
 use crate::{
@@ -14,6 +15,7 @@ use crate::{
 };
 
 pub mod bus;
+pub mod pipe;
 
 const MAX_PACKET_SIZE: usize = 64;
 
@@ -76,9 +78,10 @@ impl<'d, T: Instance> USBHsHostDriver<'d, T> {
 }
 
 impl<'d, T: Instance> async_usb_host::Driver for USBHsHostDriver<'d, T> {
-    type Bus = Bus<'d, T>;
+    type Bus = Bus<T>;
+    type Pipe = Pipe<'d, T>;
 
-    fn start(self) -> Self::Bus {
+    fn start(self) -> (Self::Bus, Self::Pipe) {
         let USBHsHostDriver {
             _phantom,
             tx_buf,
@@ -128,6 +131,6 @@ impl<'d, T: Instance> async_usb_host::Driver for USBHsHostDriver<'d, T> {
 
         unsafe { T::Interrupt::enable() };
 
-        Bus::new(tx_buf, rx_buf)
+        (Bus::new(), Pipe::new(tx_buf, rx_buf))
     }
 }
