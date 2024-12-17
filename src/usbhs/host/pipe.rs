@@ -3,7 +3,10 @@ use core::{future::poll_fn, marker::PhantomData, task::Poll};
 use async_usb_host::{errors::UsbHostError, types::Pid};
 use ch32_metapac::usbhs::vals::{HostTxResponse, Tog};
 
-use crate::{usb::EndpointDataBuffer, usbhs::{host::TX_WAKER, Instance}};
+use crate::{
+    usb::EndpointDataBuffer,
+    usbhs::{host::PIPE_WAKER, Instance},
+};
 
 use super::MAX_PACKET_SIZE;
 
@@ -50,9 +53,11 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
         });
 
         poll_fn(|ctx| {
-            TX_WAKER.register(ctx.waker());
+            PIPE_WAKER.register(ctx.waker());
             let transfer = h.int_fg().read().transfer();
             let status = h.int_st().read();
+
+            trace!("setup poll_fn");
 
             if transfer {
                 // First stop sending more setup
@@ -96,7 +101,7 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
         });
 
         poll_fn(|ctx| {
-            TX_WAKER.register(ctx.waker());
+            PIPE_WAKER.register(ctx.waker());
             let transfer = h.int_fg().read().transfer();
             let status = h.int_st().read();
             if transfer {
@@ -162,7 +167,7 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
         });
 
         poll_fn(|ctx| {
-            TX_WAKER.register(ctx.waker());
+            PIPE_WAKER.register(ctx.waker());
             let transfer = h.int_fg().read().transfer();
             let status = h.int_st().read();
 

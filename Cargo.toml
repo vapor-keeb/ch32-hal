@@ -13,7 +13,7 @@ readme = "README.md"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-async-usb-host = { path = '../async-usb-host', features = ["defmt"]}
+async-usb-host = { path = '../async-usb-host', features = ["defmt"] }
 ch32-metapac = { features = [
     "rt",
 ], git = "https://github.com/vapor-keeb/ch32-metapac", branch = "main" }
@@ -62,6 +62,7 @@ highcode = ["qingke-rt/highcode"]
 embassy = [
     "dep:embassy-time-driver",
     "dep:embassy-time",
+    "async-usb-host/embassy",
 ]
 defmt = ["dep:defmt"]
 memory-x = ["ch32-metapac/memory-x"]
