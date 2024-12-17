@@ -4,10 +4,7 @@ use async_usb_host::{errors::UsbHostError, types::Pid, Event};
 use ch32_metapac::usbhs::vals::{HostTxResponse, Tog};
 use embassy_time::Timer;
 
-use crate::{
-    usb::EndpointDataBuffer,
-    usbhs::{host::TX_WAKER, Instance},
-};
+use crate::usbhs::{Instance};
 
 use super::{BUS_WAKER, MAX_PACKET_SIZE};
 
