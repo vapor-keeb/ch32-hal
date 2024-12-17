@@ -20,8 +20,7 @@ pub mod pipe;
 const MAX_PACKET_SIZE: usize = 64;
 
 pub(crate) static BUS_WAKER: AtomicWaker = AtomicWaker::new();
-pub(crate) static TX_WAKER: AtomicWaker = AtomicWaker::new();
-// static RX_WAKER: AtomicWaker = AtomicWaker::new();
+pub(crate) static PIPE_WAKER: AtomicWaker = AtomicWaker::new();
 
 pub struct InterruptHandler<T: Instance> {
     _phantom: PhantomData<T>,
@@ -42,8 +41,7 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
         }
         if flag.transfer() {
             r.int_en().modify(|v| v.set_transfer(false));
-            TX_WAKER.wake();
-            // RX_WAKER.wake();
+            PIPE_WAKER.wake();
         }
 
         trace!("irq: {:x}", flag.0);
