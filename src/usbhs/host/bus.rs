@@ -1,10 +1,14 @@
-use core::{future::poll_fn, marker::PhantomData, task::Poll};
+use core::{
+    future::{poll_fn, Future},
+    marker::PhantomData,
+    task::Poll,
+};
 
 use async_usb_host::{errors::UsbHostError, types::Pid, Event};
 use ch32_metapac::usbhs::vals::{HostTxResponse, Tog};
 use embassy_time::Timer;
 
-use crate::usbhs::{Instance};
+use crate::usbhs::Instance;
 
 use super::{BUS_WAKER, MAX_PACKET_SIZE};
 
@@ -14,9 +18,7 @@ pub struct Bus<T: Instance> {
 
 impl<T: Instance> Bus<T> {
     pub(crate) fn new() -> Self {
-        Bus {
-            _phantom: PhantomData,
-        }
+        Bus { _phantom: PhantomData }
     }
 }
 
@@ -48,7 +50,7 @@ impl<T: Instance> async_usb_host::Bus for Bus<T> {
         });
     }
 
-    async fn poll(&mut self) -> Event {
+    fn poll(&mut self) -> impl Future<Output = Event> {
         poll_fn(|ctx| {
             BUS_WAKER.register(ctx.waker());
 
@@ -86,6 +88,5 @@ impl<T: Instance> async_usb_host::Bus for Bus<T> {
 
             // TODO more flags
         })
-        .await
     }
 }
