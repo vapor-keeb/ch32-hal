@@ -124,7 +124,7 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
                             Err(UsbHostError::WrongTog)
                         }
                     }
-                    Pid::NAK => panic!("NAK"),
+                    Pid::NAK => Err(UsbHostError::NAK),
                     Pid::STALL => Err(UsbHostError::STALL),
                     pid => {
                         panic!("Unexpected pid: {}", pid)
@@ -162,6 +162,7 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
             });
         });
         h.ep_pid().write(|v| {
+            // TODO: questionable
             v.set_endp(0);
             v.set_token(Pid::OUT as u8);
         });
