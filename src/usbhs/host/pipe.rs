@@ -83,7 +83,7 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
         .await
     }
 
-    async fn data_in(&mut self, buf: &mut [u8]) -> Result<usize, UsbHostError> {
+    async fn data_in(&mut self, endpoint: u8, buf: &mut [u8]) -> Result<usize, UsbHostError> {
         let h = T::hregs();
         // Send IN token to allow the bytes to come in
         critical_section::with(|_| {
@@ -96,7 +96,7 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
             });
         });
         h.ep_pid().write(|v| {
-            v.set_endp(0);
+            v.set_endp(endpoint);
             v.set_token(Pid::IN as u8);
         });
 
@@ -124,7 +124,19 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
                             Err(UsbHostError::WrongTog)
                         }
                     }
-                    Pid::NAK => Err(UsbHostError::NAK),
+                    Pid::NAK => {
+                        // TODO not the most clean way to deal with this failure
+                        critical_section::with(|_| {
+                            h.rx_ctrl().modify(|v| {
+                                v.set_r_tog(match v.r_tog() {
+                                    Tog::DATA0 => Tog::DATA1,
+                                    Tog::DATA1 => Tog::DATA0,
+                                    _ => panic!(),
+                                });
+                            });
+                        });
+                        Err(UsbHostError::NAK)
+                    }
                     Pid::STALL => Err(UsbHostError::STALL),
                     pid => {
                         panic!("Unexpected pid: {}", pid)
@@ -143,7 +155,7 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
         .await
     }
 
-    async fn data_out(&mut self, buf: &[u8]) -> Result<(), UsbHostError> {
+    async fn data_out(&mut self, endpoint: u8, buf: &[u8]) -> Result<(), UsbHostError> {
         if buf.len() > MAX_PACKET_SIZE {
             return Err(UsbHostError::BufferOverflow);
         }
@@ -163,7 +175,7 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
         });
         h.ep_pid().write(|v| {
             // TODO: questionable
-            v.set_endp(0);
+            v.set_endp(endpoint);
             v.set_token(Pid::OUT as u8);
         });
 
@@ -180,7 +192,19 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
                 let device_response = unwrap!(TryInto::<Pid>::try_into(status.h_res()));
                 let res = match device_response {
                     Pid::ACK => Ok(()),
-                    Pid::NAK => Err(UsbHostError::NAK),
+                    Pid::NAK => {
+                        // TODO not the most clean way to deal with this failure
+                        critical_section::with(|_| {
+                            h.tx_ctrl().modify(|v| {
+                                v.set_t_tog(match v.t_tog() {
+                                    Tog::DATA0 => Tog::DATA1,
+                                    Tog::DATA1 => Tog::DATA0,
+                                    _ => panic!(),
+                                });
+                            });
+                        });
+                        Err(UsbHostError::NAK)
+                    }
                     Pid::STALL => Err(UsbHostError::STALL),
                     _ => panic!("??? {:?}", device_response),
                 };
