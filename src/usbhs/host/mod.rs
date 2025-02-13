@@ -43,8 +43,6 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
             r.int_en().modify(|v| v.set_transfer(false));
             PIPE_WAKER.wake();
         }
-
-        trace!("irq: {:x}", flag.0);
     }
 }
 
