@@ -34,7 +34,6 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
 
     /// Send the 8 byte setup
     async fn setup(&mut self, buf: &[u8; 8]) -> Result<(), UsbHostError> {
-        trace!("setup: {:x}", buf);
         let h = T::hregs();
 
         self.tx_buf.write_volatile(buf);
@@ -56,8 +55,6 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
             PIPE_WAKER.register(ctx.waker());
             let transfer = h.int_fg().read().transfer();
             let status = h.int_st().read();
-
-            trace!("setup poll_fn");
 
             if transfer {
                 // First stop sending more setup
@@ -107,7 +104,6 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
             if transfer {
                 // First stop sending
                 h.ep_pid().write(|_| {});
-                trace!("status: {}", status.0);
                 let res = match unwrap!(TryInto::<Pid>::try_into(status.h_res())) {
                     Pid::DATA0 | Pid::DATA1 => {
                         if status.tog_ok() {
