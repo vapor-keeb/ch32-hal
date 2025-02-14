@@ -100,7 +100,7 @@ impl<'d, T: Instance> async_usb_host::Driver for USBHsHostDriver<'d, T> {
 
         r.ctrl().write(|w| {
             w.set_host_mode(true);
-            w.set_speed_type(SpeedType::FULLSPEED);
+            w.set_speed_type(SpeedType::HIGHSPEED);
             w.set_int_busy(true);
             w.set_dma_en(true);
         });

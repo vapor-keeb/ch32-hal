@@ -1,6 +1,9 @@
 use core::{future::poll_fn, marker::PhantomData, task::Poll};
 
-use async_usb_host::{errors::UsbHostError, types::Pid};
+use async_usb_host::{
+    errors::UsbHostError,
+    types::{DataTog, Pid},
+};
 use ch32_metapac::usbhs::vals::{HostTxResponse, Tog};
 
 use crate::{
@@ -80,15 +83,14 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
         .await
     }
 
-    async fn data_in(&mut self, endpoint: u8, buf: &mut [u8]) -> Result<usize, UsbHostError> {
+    async fn data_in(&mut self, endpoint: u8, tog: DataTog, buf: &mut [u8]) -> Result<usize, UsbHostError> {
         let h = T::hregs();
         // Send IN token to allow the bytes to come in
         critical_section::with(|_| {
             h.rx_ctrl().modify(|v| {
-                v.set_r_tog(match v.r_tog() {
-                    Tog::DATA0 => Tog::DATA1,
-                    Tog::DATA1 => Tog::DATA0,
-                    _ => panic!(),
+                v.set_r_tog(match tog {
+                    DataTog::DATA0 => Tog::DATA0,
+                    DataTog::DATA1 => Tog::DATA1,
                 });
             });
         });
@@ -120,19 +122,7 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
                             Err(UsbHostError::WrongTog)
                         }
                     }
-                    Pid::NAK => {
-                        // TODO not the most clean way to deal with this failure
-                        critical_section::with(|_| {
-                            h.rx_ctrl().modify(|v| {
-                                v.set_r_tog(match v.r_tog() {
-                                    Tog::DATA0 => Tog::DATA1,
-                                    Tog::DATA1 => Tog::DATA0,
-                                    _ => panic!(),
-                                });
-                            });
-                        });
-                        Err(UsbHostError::NAK)
-                    }
+                    Pid::NAK => Err(UsbHostError::NAK),
                     Pid::STALL => Err(UsbHostError::STALL),
                     pid => {
                         panic!("Unexpected pid: {}", pid)
@@ -151,7 +141,7 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
         .await
     }
 
-    async fn data_out(&mut self, endpoint: u8, buf: &[u8]) -> Result<(), UsbHostError> {
+    async fn data_out(&mut self, endpoint: u8, tog: DataTog, buf: &[u8]) -> Result<(), UsbHostError> {
         if buf.len() > MAX_PACKET_SIZE {
             return Err(UsbHostError::BufferOverflow);
         }
@@ -162,10 +152,9 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
         h.tx_len().write(|v| v.set_len(buf.len() as u16));
         critical_section::with(|_| {
             h.tx_ctrl().modify(|v| {
-                v.set_t_tog(match v.t_tog() {
-                    Tog::DATA0 => Tog::DATA1,
-                    Tog::DATA1 => Tog::DATA0,
-                    _ => panic!(),
+                v.set_t_tog(match tog {
+                    DataTog::DATA0 => Tog::DATA0,
+                    DataTog::DATA1 => Tog::DATA1,
                 });
             });
         });
@@ -188,19 +177,7 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
                 let device_response = unwrap!(TryInto::<Pid>::try_into(status.h_res()));
                 let res = match device_response {
                     Pid::ACK => Ok(()),
-                    Pid::NAK => {
-                        // TODO not the most clean way to deal with this failure
-                        critical_section::with(|_| {
-                            h.tx_ctrl().modify(|v| {
-                                v.set_t_tog(match v.t_tog() {
-                                    Tog::DATA0 => Tog::DATA1,
-                                    Tog::DATA1 => Tog::DATA0,
-                                    _ => panic!(),
-                                });
-                            });
-                        });
-                        Err(UsbHostError::NAK)
-                    }
+                    Pid::NAK => Err(UsbHostError::NAK),
                     Pid::STALL => Err(UsbHostError::STALL),
                     _ => panic!("??? {:?}", device_response),
                 };
