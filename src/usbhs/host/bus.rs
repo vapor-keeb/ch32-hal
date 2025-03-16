@@ -4,13 +4,12 @@ use core::{
     task::Poll,
 };
 
-use async_usb_host::{errors::UsbHostError, types::Pid, Event};
-use ch32_metapac::usbhs::vals::{HostTxResponse, Tog};
+use async_usb_host::Event;
 use embassy_time::Timer;
 
 use crate::usbhs::Instance;
 
-use super::{BUS_WAKER, MAX_PACKET_SIZE};
+use super::BUS_WAKER;
 
 pub struct Bus<T: Instance> {
     _phantom: PhantomData<T>,
