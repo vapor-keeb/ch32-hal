@@ -27,6 +27,15 @@ impl<'d, T: Instance> Pipe<'d, T> {
             rx_buf,
         }
     }
+
+    fn handle_device_response(status: ch32_metapac::usbhs::regs::IntSt) -> Result<Pid, UsbHostError> {
+        let hres = status.h_res();
+        TryInto::<Pid>::try_into(hres).or_else(|_| {
+            #[cfg(feature = "defmt")]
+            error!("Invalid PID value: {:x}", hres);
+            Err(UsbHostError::UnexpectedPID)
+        })
+    }
 }
 
 impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
@@ -64,12 +73,16 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
                 h.ep_pid().write(|_| {});
 
                 // Check what the device responded
-                let device_response = unwrap!(TryInto::<Pid>::try_into(status.h_res()));
+                let device_response = Self::handle_device_response(status)?;
                 let res = match device_response {
                     Pid::ACK => Ok(()),
                     Pid::NAK => Err(UsbHostError::NAK),
                     Pid::STALL => Err(UsbHostError::STALL),
-                    r => panic!("??? {:?} {:x}", r, status.h_res()),
+                    r => {
+                        #[cfg(feature = "defmt")]
+                        error!("Unexpected PID: {:?}", r);
+                        Err(UsbHostError::UnexpectedPID)
+                    },
                 };
 
                 // Mark transfer as complete
@@ -106,7 +119,9 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
             if transfer {
                 // First stop sending
                 h.ep_pid().write(|_| {});
-                let res = match unwrap!(TryInto::<Pid>::try_into(status.h_res())) {
+
+                let device_response = Self::handle_device_response(status)?;
+                let res = match device_response {
                     Pid::DATA0 | Pid::DATA1 => {
                         if status.tog_ok() {
                             let bytes_read = h.rx_len().read() as usize;
@@ -118,6 +133,7 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
                                 Ok(bytes_read)
                             }
                         } else {
+                            #[cfg(feature = "defmt")]
                             error!("Wrong TOG");
                             Err(UsbHostError::WrongTog)
                         }
@@ -125,7 +141,9 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
                     Pid::NAK => Err(UsbHostError::NAK),
                     Pid::STALL => Err(UsbHostError::STALL),
                     pid => {
-                        panic!("Unexpected pid: {}", pid)
+                        #[cfg(feature = "defmt")]
+                        error!("Unexpected PID: {:?}", pid);
+                        Err(UsbHostError::UnexpectedPID)
                     }
                 };
 
@@ -174,12 +192,16 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
                 h.ep_pid().write(|_| {});
 
                 // Check what the device responded
-                let device_response = unwrap!(TryInto::<Pid>::try_into(status.h_res()));
+                let device_response = Self::handle_device_response(status)?;
                 let res = match device_response {
                     Pid::ACK => Ok(()),
                     Pid::NAK => Err(UsbHostError::NAK),
                     Pid::STALL => Err(UsbHostError::STALL),
-                    _ => panic!("??? {:?}", device_response),
+                    pid => {
+                        #[cfg(feature = "defmt")]
+                        error!("Unexpected PID: {:?}", pid);
+                        Err(UsbHostError::UnexpectedPID)
+                    }
                 };
 
                 // Mark transfer as complete
