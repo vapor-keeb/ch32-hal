@@ -73,7 +73,7 @@ impl<'d, T: Instance> USBHsHostDriver<'d, T> {
     }
 }
 
-impl<'d, T: Instance> async_usb_host::Driver for USBHsHostDriver<'d, T> {
+impl<'d, T: Instance> async_usb_host::HostDriver for USBHsHostDriver<'d, T> {
     type Bus = Bus<T>;
     type Pipe = Pipe<'d, T>;
 
