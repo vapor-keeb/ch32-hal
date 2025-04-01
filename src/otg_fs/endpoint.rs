@@ -1,9 +1,9 @@
+use core::future::poll_fn;
 use core::marker::PhantomData;
 use core::task::Poll;
 
 use ch32_metapac::otg::vals::{EpRxResponse, EpTxResponse, UsbToken};
 use embassy_usb_driver::{Direction, EndpointError, EndpointInfo};
-use futures::future::poll_fn;
 
 use super::{Instance, EP_MAX_PACKET_SIZE, EP_WAKERS};
 use crate::interrupt::typelevel::Interrupt;
