@@ -56,6 +56,7 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
         h.tx_ctrl().write(|v| {
             v.set_t_tog(Tog::DATA0);
             v.set_t_res(HostTxResponse::ACK);
+            v.set_t_data_no(false); // Expect to write data packets
         });
 
         h.ep_pid().write(|v| {
@@ -82,13 +83,44 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
                         #[cfg(feature = "defmt")]
                         error!("Unexpected PID: {:?}", r);
                         Err(UsbHostError::UnexpectedPID)
-                    },
+                    }
                 };
 
                 // Mark transfer as complete
                 h.int_fg().write(|w| w.set_transfer(true));
                 critical_section::with(|_| h.int_en().modify(|w| w.set_transfer(true)));
                 Poll::Ready(res)
+            } else {
+                Poll::Pending
+            }
+        })
+        .await
+    }
+
+    async fn ssplit(&mut self, port: u8, ep_type: u8) -> Result<(), UsbHostError> {
+        let hregs = T::hregs();
+        defmt::assert!(hregs.mis_st().read().split_can(), "can't split");
+
+        critical_section::with(|_| {
+            hregs.tx_ctrl().modify(|v| v.set_t_data_no(true));
+        });
+
+        // ET 2b | E(0) ??? 1b | S (0) 1b | Port 7b | C(1)/S(0) 1b
+        let split_data = ((ep_type as u16 & 0x3) << 10) | ((port as u16 & 0x7F) << 1) | 0b0u16;
+        hregs.split_data().write(|v| v.set_split_data(split_data));
+        hregs.ep_pid().write(|v| v.set_token(Pid::SPLIT as u8));
+
+        poll_fn(|ctx| {
+            PIPE_WAKER.register(ctx.waker());
+            let transfer = hregs.int_fg().read().transfer();
+
+            if transfer {
+                // First stop sending more setup
+                hregs.ep_pid().write(|_| {});
+
+                hregs.int_fg().write(|w| w.set_transfer(true));
+                critical_section::with(|_| hregs.int_en().modify(|w| w.set_transfer(true)));
+                Poll::Ready(Ok(()))
             } else {
                 Poll::Pending
             }
@@ -125,7 +157,7 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
                     Pid::DATA0 | Pid::DATA1 => {
                         if status.tog_ok() {
                             let bytes_read = h.rx_len().read() as usize;
-                            debug_assert!(bytes_read <= 64); // TODO: FIX THIS when we have a size for self.rx_buf
+                            defmt::debug_assert!(bytes_read <= 64); // TODO: FIX THIS when we have a size for self.rx_buf
                             if bytes_read > buf.len() {
                                 Err(UsbHostError::BufferOverflow)
                             } else {
@@ -174,6 +206,7 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
                     DataTog::DATA0 => Tog::DATA0,
                     DataTog::DATA1 => Tog::DATA1,
                 });
+                v.set_t_data_no(false); // Expect to write data packets
             });
         });
         h.ep_pid().write(|v| {

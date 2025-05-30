@@ -4,7 +4,8 @@ use core::{
     task::Poll,
 };
 
-use async_usb_host::Event;
+use async_usb_host::{types::UsbSpeed, Event};
+use defmt::todo;
 use embassy_time::Timer;
 
 use crate::usbhs::Instance;
@@ -23,29 +24,36 @@ impl<T: Instance> Bus<T> {
 
 impl<T: Instance> async_usb_host::Bus for Bus<T> {
     async fn reset(&mut self) {
-        // follow example code from openwch
+        // follow example code from openwch (`USBHSH_ResetRootHubPort`)
         T::hregs().dev_ad().write(|v| v.set_addr(0));
+
         critical_section::with(|_| {
             T::hregs().ctrl().modify(|v| {
                 v.set_tx_bus_reset(true);
             });
         });
-        Timer::after_millis(15).await;
+        Timer::after_millis(11).await;
         critical_section::with(|_| {
             T::hregs().ctrl().modify(|v| {
                 v.set_tx_bus_reset(false);
             });
         });
+
+        // magic wait also from openwch
         Timer::after_millis(2).await;
+
         // copied from openwch
         if T::hregs().int_fg().read().detect() {
             if T::hregs().mis_st().read().dev_attach() {
-                panic!("attach after reset");
+                todo!("attach after reset");
             }
         }
-        // don't let the bus sleep (NOT GOOD)
+
+        if T::hregs().ctrl().read().sof_en() {
+            info!("sof_en already enabled.");
+        }
         critical_section::with(|_| {
-            T::hregs().ctrl().modify(|w| w.set_sof_en(true));
+            T::hregs().ctrl().modify(|v| v.set_sof_en(true));
         });
     }
 
@@ -87,5 +95,16 @@ impl<T: Instance> async_usb_host::Bus for Bus<T> {
 
             // TODO more flags
         })
+    }
+
+    async fn speed(&mut self) -> Option<UsbSpeed> {
+        let hregs = T::hregs();
+        use ch32_metapac::usbhs::vals::SpeedType;
+        match hregs.speed_type().read().speed_type() {
+            SpeedType::FULLSPEED => Some(UsbSpeed::FullSpeed),
+            SpeedType::HIGHSPEED => Some(UsbSpeed::HighSpeed),
+            SpeedType::LOWSPEED => Some(UsbSpeed::LowSpeed),
+            SpeedType::_RESERVED_3 => None,
+        }
     }
 }

@@ -100,7 +100,12 @@ impl<'d, T: Instance> async_usb_host::HostDriver for USBHsHostDriver<'d, T> {
 
         r.ctrl().write(|w| {
             w.set_host_mode(true);
-            w.set_speed_type(SpeedType::FULLSPEED);
+            // openwch: Must select highspeed for host operation. It seems like
+            // it doesn't work correctly as a host in full speed mode. Some
+            // devices (i.e. WCH32 itself) won't enumerate correctly.
+            // Could be a software issue / we are not doing something right, but
+            // in the mean time, this is a workaround.
+            w.set_speed_type(SpeedType::HIGHSPEED);
             w.set_int_busy(true);
             w.set_dma_en(true);
         });
