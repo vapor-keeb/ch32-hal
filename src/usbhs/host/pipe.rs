@@ -45,7 +45,8 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
     }
 
     /// Send the 8 byte setup
-    async fn setup(&mut self, buf: &[u8; 8]) -> Result<(), UsbHostError> {
+    async fn setup(&mut self, buf: &[u8]) -> Result<(), UsbHostError> {
+        assert!(buf.len() == 8 || buf.is_empty(), "Setup packet must be 8 bytes long or empty (CSPLIT)");
         let h = T::hregs();
 
         self.tx_buf.write_volatile(buf);
@@ -79,6 +80,7 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
                     Pid::ACK => Ok(()),
                     Pid::NAK => Err(UsbHostError::NAK),
                     Pid::STALL => Err(UsbHostError::STALL),
+                    Pid::NYET => Err(UsbHostError::NYET),
                     r => {
                         #[cfg(feature = "defmt")]
                         error!("Unexpected PID: {:?}", r);
@@ -97,7 +99,7 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
         .await
     }
 
-    async fn ssplit(&mut self, port: u8, ep_type: u8) -> Result<(), UsbHostError> {
+    async fn split(&mut self, complete: bool, port: u8, ep_type: u8) -> Result<(), UsbHostError> {
         let hregs = T::hregs();
         defmt::assert!(hregs.mis_st().read().split_can(), "can't split");
 
@@ -106,7 +108,7 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
         });
 
         // ET 2b | E(0) ??? 1b | S (0) 1b | Port 7b | C(1)/S(0) 1b
-        let split_data = ((ep_type as u16 & 0x3) << 10) | ((port as u16 & 0x7F) << 1) | 0b0u16;
+        let split_data = ((ep_type as u16 & 0x3) << 10) | ((port as u16 & 0x7F) << 1) | complete as u16;
         hregs.split_data().write(|v| v.set_split_data(split_data));
         hregs.ep_pid().write(|v| v.set_token(Pid::SPLIT as u8));
 
@@ -172,6 +174,7 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
                     }
                     Pid::NAK => Err(UsbHostError::NAK),
                     Pid::STALL => Err(UsbHostError::STALL),
+                    Pid::NYET => Err(UsbHostError::NYET),
                     pid => {
                         #[cfg(feature = "defmt")]
                         error!("Unexpected PID: {:?}", pid);
@@ -230,6 +233,7 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
                     Pid::ACK => Ok(()),
                     Pid::NAK => Err(UsbHostError::NAK),
                     Pid::STALL => Err(UsbHostError::STALL),
+                    Pid::NYET => Err(UsbHostError::NYET),
                     pid => {
                         #[cfg(feature = "defmt")]
                         error!("Unexpected PID: {:?}", pid);
