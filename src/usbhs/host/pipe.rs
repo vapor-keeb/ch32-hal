@@ -142,6 +142,7 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
         // Send IN token to allow the bytes to come in
         critical_section::with(|_| {
             h.rx_ctrl().modify(|v| {
+                v.set_r_data_no(buf.is_empty());
                 v.set_r_tog(match tog {
                     DataTog::DATA0 => Tog::DATA0,
                     DataTog::DATA1 => Tog::DATA1,
@@ -179,6 +180,10 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
                             Err(UsbHostError::WrongTog)
                         }
                     }
+                    Pid::ACK => {
+                        defmt::assert!(buf.is_empty());
+                        Ok(0)
+                    }
                     Pid::NAK => Err(UsbHostError::NAK),
                     Pid::STALL => Err(UsbHostError::STALL),
                     Pid::NYET => Err(UsbHostError::NYET),
@@ -201,22 +206,26 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
         .await
     }
 
-    async fn data_out(&mut self, endpoint: u8, tog: DataTog, buf: &[u8]) -> Result<(), UsbHostError> {
-        if buf.len() > MAX_PACKET_SIZE {
-            return Err(UsbHostError::BufferOverflow);
+    async fn data_out(&mut self, endpoint: u8, tog: DataTog, buf: Option<&[u8]>) -> Result<(), UsbHostError> {
+        let h = T::hregs();
+        if let Some(b) = buf {
+            if b.len() > MAX_PACKET_SIZE {
+                return Err(UsbHostError::BufferOverflow);
+            }
+            self.tx_buf.write_volatile(b);
+            h.tx_len().write(|v| v.set_len(b.len() as u16));
+        } else {
+            // LOL
+            // h.tx_len().write(|v| v.set_len(0));
         }
 
-        let h = T::hregs();
-
-        self.tx_buf.write_volatile(buf);
-        h.tx_len().write(|v| v.set_len(buf.len() as u16));
         critical_section::with(|_| {
             h.tx_ctrl().modify(|v| {
                 v.set_t_tog(match tog {
                     DataTog::DATA0 => Tog::DATA0,
                     DataTog::DATA1 => Tog::DATA1,
                 });
-                v.set_t_data_no(false); // Expect to write data packets
+                v.set_t_data_no(buf.is_none());
             });
         });
         h.ep_pid().write(|v| {
