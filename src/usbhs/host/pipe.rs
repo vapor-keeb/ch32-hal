@@ -45,19 +45,20 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
     }
 
     /// Send the 8 byte setup
-    async fn setup(&mut self, buf: &[u8]) -> Result<(), UsbHostError> {
-        assert!(buf.len() == 8 || buf.is_empty(), "Setup packet must be 8 bytes long or empty (CSPLIT)");
+    async fn setup(&mut self, buf: Option<&[u8; 8]>) -> Result<(), UsbHostError> {
         let h = T::hregs();
 
-        self.tx_buf.write_volatile(buf);
-        h.tx_len().write(|v| v.set_len(buf.len() as u16));
+        if let Some(b) = buf {
+            self.tx_buf.write_volatile(b);
+            h.tx_len().write(|v| v.set_len(8));
+        }
         h.rx_ctrl().write(|v| {
             v.set_r_tog(Tog::DATA0);
         });
         h.tx_ctrl().write(|v| {
             v.set_t_tog(Tog::DATA0);
             v.set_t_res(HostTxResponse::ACK);
-            v.set_t_data_no(false); // Expect to write data packets
+            v.set_t_data_no(buf.is_none()); // Expect to write data packets
         });
 
         h.ep_pid().write(|v| {
