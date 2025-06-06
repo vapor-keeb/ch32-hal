@@ -2,10 +2,13 @@ use core::{future::poll_fn, marker::PhantomData, task::Poll};
 
 use async_usb_host::{
     errors::UsbHostError,
-    types::{DataTog, Pid},
+    types::{DataTog, EndpointType, Pid, UsbSpeed},
 };
-use ch32_metapac::usbhs::vals::{HostTxResponse, Tog};
-use embassy_time::Timer;
+use ch32_metapac::usbhs::{
+    regs::EpType,
+    vals::{HostTxResponse, Tog},
+};
+use embassy_time::{Duration, Timer};
 
 use crate::{
     usb::EndpointDataBuffer,
@@ -101,23 +104,51 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
         .await
     }
 
-    async fn split(&mut self, complete: bool, port: u8, ep_type: u8) -> Result<(), UsbHostError> {
+    async fn split(
+        &mut self,
+        complete: bool,
+        port: u8,
+        ep_type: EndpointType,
+        speed: UsbSpeed,
+    ) -> Result<(), UsbHostError> {
         let hregs = T::hregs();
         // defmt::assert!(hregs.mis_st().read().split_can(), "can't split");
         // This RO register might indicate that we can't split, but somehow
         // if we ignore it, it works anyway. Log it for now.
-        if !hregs.mis_st().read().split_can() {
-            warn!("split_can register is not set, but split is called");
+        if complete {
+            trace!("csplit");
+        } else {
+            trace!("ssplit")
         }
+
+        let now = embassy_time::Instant::now();
+        while !hregs.mis_st().read().split_can() {
+            if embassy_time::Instant::now().duration_since(now) > Duration::from_millis(50) {
+                warn!("split_can register is not set, but split is called");
+                break;
+            }
+        }
+        let waited = embassy_time::Instant::now().duration_since(now);
 
         critical_section::with(|_| {
             hregs.tx_ctrl().modify(|v| v.set_t_data_no(true));
         });
 
         // ET 2b | E(0) ??? 1b | S (0) 1b | Port 7b | C(1)/S(0) 1b
-        let split_data = ((ep_type as u16 & 0x3) << 10) | ((port as u16 & 0x7F) << 1) | complete as u16;
+        let se = match ep_type {
+            EndpointType::Control | EndpointType::Interrupt => match speed {
+                UsbSpeed::FullSpeed => 0b00,
+                UsbSpeed::LowSpeed => 0b01,
+                _ => panic!("L/F speed only"),
+            },
+            _ => todo!("bulk / iso"),
+        };
+        let split_data = ((ep_type as u16 & 0x3) << 10) | (se << 8) | ((port as u16 & 0x7F) << 1) | complete as u16;
         hregs.split_data().write(|v| v.set_split_data(split_data));
         hregs.ep_pid().write(|v| v.set_token(Pid::SPLIT as u8));
+
+
+        // info!("had to wait {:?} for split_can", waited);
 
         poll_fn(|ctx| {
             PIPE_WAKER.register(ctx.waker());
@@ -137,7 +168,13 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
         .await
     }
 
-    async fn data_in(&mut self, endpoint: u8, tog: DataTog, buf: &mut [u8]) -> Result<usize, UsbHostError> {
+    async fn data_in(
+        &mut self,
+        endpoint: u8,
+        tog: DataTog,
+        wait_for_reply: bool,
+        buf: &mut [u8],
+    ) -> Result<usize, UsbHostError> {
         let h = T::hregs();
         // Send IN token to allow the bytes to come in
         critical_section::with(|_| {
@@ -162,36 +199,40 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
                 // First stop sending
                 h.ep_pid().write(|_| {});
 
-                let device_response = Self::handle_device_response(status)?;
-                let res = match device_response {
-                    Pid::DATA0 | Pid::DATA1 => {
-                        if status.tog_ok() {
-                            let bytes_read = h.rx_len().read() as usize;
-                            defmt::debug_assert!(bytes_read <= 64); // TODO: FIX THIS when we have a size for self.rx_buf
-                            if bytes_read > buf.len() {
-                                Err(UsbHostError::BufferOverflow)
+                let res = if wait_for_reply {
+                    let device_response = Self::handle_device_response(status)?;
+                    match device_response {
+                        Pid::DATA0 | Pid::DATA1 => {
+                            if status.tog_ok() {
+                                let bytes_read = h.rx_len().read() as usize;
+                                defmt::debug_assert!(bytes_read <= 64); // TODO: FIX THIS when we have a size for self.rx_buf
+                                if bytes_read > buf.len() {
+                                    Err(UsbHostError::BufferOverflow)
+                                } else {
+                                    self.rx_buf.read_volatile(&mut buf[..bytes_read]);
+                                    Ok(bytes_read)
+                                }
                             } else {
-                                self.rx_buf.read_volatile(&mut buf[..bytes_read]);
-                                Ok(bytes_read)
+                                #[cfg(feature = "defmt")]
+                                error!("Wrong TOG");
+                                Err(UsbHostError::WrongTog)
                             }
-                        } else {
+                        }
+                        Pid::ACK => {
+                            defmt::assert!(buf.is_empty());
+                            Ok(0)
+                        }
+                        Pid::NAK => Err(UsbHostError::NAK),
+                        Pid::STALL => Err(UsbHostError::STALL),
+                        Pid::NYET => Err(UsbHostError::NYET),
+                        pid => {
                             #[cfg(feature = "defmt")]
-                            error!("Wrong TOG");
-                            Err(UsbHostError::WrongTog)
+                            error!("Unexpected PID: {:?}", pid);
+                            Err(UsbHostError::UnexpectedPID)
                         }
                     }
-                    Pid::ACK => {
-                        defmt::assert!(buf.is_empty());
-                        Ok(0)
-                    }
-                    Pid::NAK => Err(UsbHostError::NAK),
-                    Pid::STALL => Err(UsbHostError::STALL),
-                    Pid::NYET => Err(UsbHostError::NYET),
-                    pid => {
-                        #[cfg(feature = "defmt")]
-                        error!("Unexpected PID: {:?}", pid);
-                        Err(UsbHostError::UnexpectedPID)
-                    }
+                } else {
+                    Ok(0)
                 };
 
                 // Mark transfer as complete
@@ -214,9 +255,6 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
             }
             self.tx_buf.write_volatile(b);
             h.tx_len().write(|v| v.set_len(b.len() as u16));
-        } else {
-            // LOL
-            // h.tx_len().write(|v| v.set_len(0));
         }
 
         critical_section::with(|_| {
