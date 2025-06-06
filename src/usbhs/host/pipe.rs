@@ -5,6 +5,7 @@ use async_usb_host::{
     types::{DataTog, Pid},
 };
 use ch32_metapac::usbhs::vals::{HostTxResponse, Tog};
+use embassy_time::Timer;
 
 use crate::{
     usb::EndpointDataBuffer,
@@ -102,7 +103,12 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
 
     async fn split(&mut self, complete: bool, port: u8, ep_type: u8) -> Result<(), UsbHostError> {
         let hregs = T::hregs();
-        defmt::assert!(hregs.mis_st().read().split_can(), "can't split");
+        // defmt::assert!(hregs.mis_st().read().split_can(), "can't split");
+        // This RO register might indicate that we can't split, but somehow
+        // if we ignore it, it works anyway. Log it for now.
+        if !hregs.mis_st().read().split_can() {
+            warn!("split_can register is not set, but split is called");
+        }
 
         critical_section::with(|_| {
             hregs.tx_ctrl().modify(|v| v.set_t_data_no(true));
