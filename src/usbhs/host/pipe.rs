@@ -5,7 +5,7 @@ use async_usb_host::{
     types::{DataTog, EndpointType, Pid, UsbSpeed},
 };
 use ch32_metapac::usbhs::{
-    regs::EpType,
+    regs::{EpType, UhRxCtrl},
     vals::{HostTxResponse, Tog},
 };
 use embassy_time::{Duration, Timer};
@@ -112,23 +112,6 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
         speed: UsbSpeed,
     ) -> Result<(), UsbHostError> {
         let hregs = T::hregs();
-        // defmt::assert!(hregs.mis_st().read().split_can(), "can't split");
-        // This RO register might indicate that we can't split, but somehow
-        // if we ignore it, it works anyway. Log it for now.
-        if complete {
-            trace!("csplit");
-        } else {
-            trace!("ssplit")
-        }
-
-        let now = embassy_time::Instant::now();
-        while !hregs.mis_st().read().split_can() {
-            if embassy_time::Instant::now().duration_since(now) > Duration::from_millis(50) {
-                warn!("split_can register is not set, but split is called");
-                break;
-            }
-        }
-        let waited = embassy_time::Instant::now().duration_since(now);
 
         critical_section::with(|_| {
             hregs.tx_ctrl().modify(|v| v.set_t_data_no(true));
@@ -145,8 +128,13 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
         };
         let split_data = ((ep_type as u16 & 0x3) << 10) | (se << 8) | ((port as u16 & 0x7F) << 1) | complete as u16;
         hregs.split_data().write(|v| v.set_split_data(split_data));
-        hregs.ep_pid().write(|v| v.set_token(Pid::SPLIT as u8));
 
+        // This RO register might indicate that we can't split, but somehow
+        // This is pretty bad, but the HW is designed this way so must do it.
+        critical_section::with(|_| {
+            while !hregs.mis_st().read().split_can() {}
+            hregs.ep_pid().write(|v| v.set_token(Pid::SPLIT as u8));
+        });
 
         // info!("had to wait {:?} for split_can", waited);
 
@@ -173,17 +161,17 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
         endpoint: u8,
         tog: DataTog,
         wait_for_reply: bool,
+        send_ack: bool,
         buf: &mut [u8],
     ) -> Result<usize, UsbHostError> {
         let h = T::hregs();
         // Send IN token to allow the bytes to come in
-        critical_section::with(|_| {
-            h.rx_ctrl().modify(|v| {
-                v.set_r_data_no(buf.is_empty());
-                v.set_r_tog(match tog {
-                    DataTog::DATA0 => Tog::DATA0,
-                    DataTog::DATA1 => Tog::DATA1,
-                });
+        h.rx_ctrl().write(|v| {
+            v.set_r_data_no(buf.is_empty());
+            v.set_r_res_no(!send_ack); // LOL this does not work, working with WCH to figure out if HW bug
+            v.set_r_tog(match tog {
+                DataTog::DATA0 => Tog::DATA0,
+                DataTog::DATA1 => Tog::DATA1,
             });
         });
         h.ep_pid().write(|v| {
