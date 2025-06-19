@@ -235,7 +235,13 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
         .await
     }
 
-    async fn data_out(&mut self, endpoint: u8, tog: DataTog, buf: Option<&[u8]>) -> Result<(), UsbHostError> {
+    async fn data_out(
+        &mut self,
+        endpoint: u8,
+        tog: DataTog,
+        wait_for_reply: bool,
+        buf: Option<&[u8]>,
+    ) -> Result<(), UsbHostError> {
         let h = T::hregs();
         if let Some(b) = buf {
             if b.len() > MAX_PACKET_SIZE {
@@ -269,18 +275,22 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
                 // First stop sending
                 h.ep_pid().write(|_| {});
 
-                // Check what the device responded
-                let device_response = Self::handle_device_response(status)?;
-                let res = match device_response {
-                    Pid::ACK => Ok(()),
-                    Pid::NAK => Err(UsbHostError::NAK),
-                    Pid::STALL => Err(UsbHostError::STALL),
-                    Pid::NYET => Err(UsbHostError::NYET),
-                    pid => {
-                        #[cfg(feature = "defmt")]
-                        error!("Unexpected PID: {:?}", pid);
-                        Err(UsbHostError::UnexpectedPID)
+                let res = if wait_for_reply {
+                    // Check what the device responded
+                    let device_response = Self::handle_device_response(status)?;
+                    match device_response {
+                        Pid::ACK => Ok(()),
+                        Pid::NAK => Err(UsbHostError::NAK),
+                        Pid::STALL => Err(UsbHostError::STALL),
+                        Pid::NYET => Err(UsbHostError::NYET),
+                        pid => {
+                            #[cfg(feature = "defmt")]
+                            error!("Unexpected PID: {:?}", pid);
+                            Err(UsbHostError::UnexpectedPID)
+                        }
                     }
+                } else {
+                    Ok(())
                 };
 
                 // Mark transfer as complete
