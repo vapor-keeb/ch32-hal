@@ -193,7 +193,7 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
                         Pid::DATA0 | Pid::DATA1 => {
                             if status.tog_ok() {
                                 let bytes_read = h.rx_len().read() as usize;
-                                defmt::debug_assert!(bytes_read <= 64); // TODO: FIX THIS when we have a size for self.rx_buf
+                                debug_assert!(bytes_read <= 64); // TODO: FIX THIS when we have a size for self.rx_buf
                                 if bytes_read > buf.len() {
                                     Err(UsbHostError::BufferOverflow)
                                 } else {
@@ -207,7 +207,7 @@ impl<'d, T: Instance> async_usb_host::Pipe for Pipe<'d, T> {
                             }
                         }
                         Pid::ACK => {
-                            defmt::assert!(buf.is_empty());
+                            debug_assert!(buf.is_empty());
                             Ok(0)
                         }
                         Pid::NAK => Err(UsbHostError::NAK),

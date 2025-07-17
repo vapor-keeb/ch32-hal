@@ -5,7 +5,6 @@ use core::{
 };
 
 use async_usb_host::{types::UsbSpeed, Event};
-use defmt::todo;
 use embassy_time::Timer;
 
 use crate::usbhs::Instance;
